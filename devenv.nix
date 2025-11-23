@@ -16,7 +16,7 @@
       uv.enable = true;
       venv = {
         enable = true;
-        requirements = ./requirements.txt;
+        requirements = "duckdb";
       };
     };
   };
