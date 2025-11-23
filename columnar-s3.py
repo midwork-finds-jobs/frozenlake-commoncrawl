@@ -73,16 +73,18 @@ def main():
     con.execute("SET http_retry_wait_ms = 500")
 
     # Fetch crawl info (excluding oldest crawls without columnar index)
-    print("Fetching crawl metadata...")
+    # Use local file if it exists, otherwise fetch from URL
+    collinfo_source = 'collinfo.json' if os.path.exists('collinfo.json') else 'https://index.commoncrawl.org/collinfo.json'
+    print(f"Fetching crawl metadata from {collinfo_source}...")
     con.execute("""
         CREATE OR REPLACE TEMP TABLE crawl_info AS
-        FROM read_json('https://index.commoncrawl.org/collinfo.json')
+        FROM read_json(?)
         WHERE id NOT IN (
             'CC-MAIN-2012',
             'CC-MAIN-2009-2010',
             'CC-MAIN-2008-2009'
         )
-    """)
+    """, [collinfo_source])
 
     # Get list of crawl IDs
     crawl_ids = con.execute("SELECT id FROM crawl_info ORDER BY id").fetchall()
