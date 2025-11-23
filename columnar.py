@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
 """
 Convert Common Crawl columnar index to DuckLake format.
 
