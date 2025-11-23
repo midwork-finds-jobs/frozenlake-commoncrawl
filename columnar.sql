@@ -8,6 +8,10 @@ SET http_retries = 100;
 SET http_retry_backoff = 5;
 SET http_retry_wait_ms = 500;
 
+-- Create the frozen ducklake database for commoncrawl
+ATTACH 'ducklake:commoncrawl.ducklake' AS commoncrawl (DATA_PATH 'tmp_always_empty');
+
+-- Get all crawl indexes
 CREATE OR REPLACE TEMP TABLE crawl_info AS
     FROM read_json('https://index.commoncrawl.org/collinfo.json')
     WHERE id NOT IN (
@@ -17,6 +21,12 @@ CREATE OR REPLACE TEMP TABLE crawl_info AS
         'CC-MAIN-2008-2009'
     );
 
+SET VARIABLE crawl_ids = (
+    SELECT ARRAY_AGG(id)
+    FROM crawl_info
+);
+
+-- Get the list of parquet files for all crawls
 CREATE OR REPLACE TEMP TABLE crawl_parquet_files AS
     SELECT 'https://data.commoncrawl.org/' || column0 as url
     FROM read_csv(
@@ -30,14 +40,44 @@ CREATE OR REPLACE TEMP TABLE crawl_parquet_files AS
         header=false
     );
 
-ATTACH 'ducklake:commoncrawl.ducklake' AS commoncrawl (DATA_PATH 'tmp_always_empty');
+-- Create empty tables for different crawl periods due to schema changes
+SET VARIABLE newest_parquet_file = (
+    SELECT MAX(url)
+    FROM crawl_parquet_files
+);
+
+CREATE TABLE IF NOT EXISTS commoncrawl.CC_MAIN_2021_AND_FORWARD AS
+    FROM read_parquet(getvariable('newest_parquet_file'))
+    WITH NO DATA;
+
+SET VARIABLE newest_parquet_file_with_old_timestamp = (
+    SELECT MAX(url)
+    FROM crawl_parquet_files
+    INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
+    WHERE crawl_info.id = 'CC-MAIN-2021-43'
+);
+
+CREATE TABLE IF NOT EXISTS commoncrawl.CC_MAIN_2013_TO_2021 AS
+    FROM read_parquet(getvariable('newest_parquet_file_with_old_timestamp'))
+    WITH NO DATA;
+
+-- This filters away the parquet files which have already been added to the ducklake
+CREATE VIEW idempotent_parquet_files AS (
+    FROM crawl_parquet_files
+    EXCEPT
+    SELECT data_file as url
+    FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2013_TO_2021')
+    EXCEPT
+    SELECT data_file as url
+    FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2013_TO_2021')
+);
 
 -- Handle years 2013-2023 without timezone in fetch_time
 -- CC-MAIN-2018-39: new columns "content_charset" + "content_languages"
 -- CC-MAIN-2021-49: new column "url_host_name_reversed"
 SET VARIABLE parquet_files = (
     SELECT ARRAY_AGG(url)
-    FROM crawl_parquet_files
+    FROM idempotent_parquet_files
     INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
     WHERE id BETWEEN 'CC-MAIN-2013-20' AND 'CC-MAIN-2021-43'
 );
@@ -58,14 +98,10 @@ CALL ducklake_add_data_files(
 -- From 2021-49 onwards, fetch_time has timezone info
 SET VARIABLE parquet_files = (
     SELECT ARRAY_AGG(url)
-    FROM crawl_parquet_files
+    FROM idempotent_parquet_files
     INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
     WHERE id >= 'CC-MAIN-2021-49'
 );
-
-CREATE OR REPLACE TABLE commoncrawl.CC_MAIN_2021_AND_FORWARD AS
-    FROM read_parquet(list_max(getvariable('parquet_files')))
-    WITH NO DATA;
 
 -- FIXME: CALL this function for all items in parquet_files
 CALL ducklake_add_data_files(

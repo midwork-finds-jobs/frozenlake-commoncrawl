@@ -19,10 +19,20 @@ Or run with virtual environment:
 """
 
 import duckdb
+import signal
+import sys
 
 def main():
     # Create DuckDB connection
     con = duckdb.connect()
+
+    # Set up signal handler for Ctrl+C
+    def signal_handler(sig, frame):
+        print("\n\nInterrupted by user (Ctrl+C). Closing connection and exiting...")
+        con.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
 
     # Install and load extensions
     print("Installing extensions...")
@@ -77,34 +87,71 @@ def main():
     print("Attaching DuckLake database...")
     con.execute("ATTACH 'ducklake:commoncrawl.ducklake' AS commoncrawl (DATA_PATH 'tmp_always_empty')")
 
+    # Create tables with schemas from newest parquet files
+    print("\n=== Creating table schemas ===")
+
+    # Get newest parquet file for CC_MAIN_2021_AND_FORWARD
+    newest_parquet_file = con.execute("""
+        SELECT MAX(url)
+        FROM crawl_parquet_files
+    """).fetchone()[0]
+
+    print(f"Creating CC_MAIN_2021_AND_FORWARD schema from: {newest_parquet_file}")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS commoncrawl.CC_MAIN_2021_AND_FORWARD AS
+        FROM read_parquet(?)
+        WITH NO DATA
+    """, [newest_parquet_file])
+
+    # Get newest parquet file with old timestamp schema
+    newest_parquet_file_old = con.execute("""
+        SELECT MAX(url)
+        FROM crawl_parquet_files
+        INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
+        WHERE crawl_info.id = 'CC-MAIN-2021-43'
+    """).fetchone()[0]
+
+    print(f"Creating CC_MAIN_2013_TO_2021 schema from: {newest_parquet_file_old}")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS commoncrawl.CC_MAIN_2013_TO_2021 AS
+        FROM read_parquet(?)
+        WITH NO DATA
+    """, [newest_parquet_file_old])
+
+    # Create idempotent parquet files view (filters out already-added files)
+    print("\n=== Creating idempotent file list ===")
+    con.execute("""
+        CREATE OR REPLACE TEMP VIEW idempotent_parquet_files AS (
+            SELECT url FROM crawl_parquet_files
+            EXCEPT
+            SELECT data_file as url
+            FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2013_TO_2021')
+            EXCEPT
+            SELECT data_file as url
+            FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2021_AND_FORWARD')
+        )
+    """)
+
     # ========================================
     # Table 1: CC-MAIN-2013-20 to CC-MAIN-2021-43
     # (years 2013-2023 without timezone in fetch_time)
     # ========================================
     print("\n=== Processing CC-MAIN-2013-20 to CC-MAIN-2021-43 ===")
 
-    # Get parquet files for this period
+    # Get parquet files for this period (already filtered by idempotent view)
     parquet_files_2013_2021 = con.execute("""
         SELECT url
-        FROM crawl_parquet_files
+        FROM idempotent_parquet_files
         INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
         WHERE id BETWEEN 'CC-MAIN-2013-20' AND 'CC-MAIN-2021-43'
         ORDER BY url
     """).fetchall()
 
     parquet_files_2013_2021 = [row[0] for row in parquet_files_2013_2021]
-    print(f"Found {len(parquet_files_2013_2021)} parquet files for 2013-2021 period")
+    print(f"Found {len(parquet_files_2013_2021)} new parquet files to add for 2013-2021 period")
 
-    # Create table schema from first file
+    # Add each file to DuckLake
     if parquet_files_2013_2021:
-        print("Creating table CC_MAIN_2013_TO_2021...")
-        con.execute("""
-            CREATE OR REPLACE TABLE commoncrawl.CC_MAIN_2013_TO_2021 AS
-            FROM read_parquet(?)
-            WITH NO DATA
-        """, [parquet_files_2013_2021[0]])
-
-        # Add each file to DuckLake
         print(f"Adding {len(parquet_files_2013_2021)} files to CC_MAIN_2013_TO_2021...")
         for i, file_url in enumerate(parquet_files_2013_2021, 1):
             if i % 10 == 0 or i == 1:
@@ -127,28 +174,20 @@ def main():
     # ========================================
     print("\n=== Processing CC-MAIN-2021-49 onwards ===")
 
-    # Get parquet files for this period
+    # Get parquet files for this period (already filtered by idempotent view)
     parquet_files_2021_forward = con.execute("""
         SELECT url
-        FROM crawl_parquet_files
+        FROM idempotent_parquet_files
         INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
         WHERE id >= 'CC-MAIN-2021-49'
         ORDER BY url
     """).fetchall()
 
     parquet_files_2021_forward = [row[0] for row in parquet_files_2021_forward]
-    print(f"Found {len(parquet_files_2021_forward)} parquet files for 2021-forward period")
+    print(f"Found {len(parquet_files_2021_forward)} new parquet files to add for 2021-forward period")
 
-    # Create table schema from first file
+    # Add each file to DuckLake
     if parquet_files_2021_forward:
-        print("Creating table CC_MAIN_2021_AND_FORWARD...")
-        con.execute("""
-            CREATE OR REPLACE TABLE commoncrawl.CC_MAIN_2021_AND_FORWARD AS
-            FROM read_parquet(?)
-            WITH NO DATA
-        """, [parquet_files_2021_forward[0]])
-
-        # Add each file to DuckLake
         print(f"Adding {len(parquet_files_2021_forward)} files to CC_MAIN_2021_AND_FORWARD...")
         for i, file_url in enumerate(parquet_files_2021_forward, 1):
             if i % 10 == 0 or i == 1:
@@ -185,4 +224,8 @@ def main():
     con.close()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user (Ctrl+C). Exiting gracefully...")
+        exit(0)
