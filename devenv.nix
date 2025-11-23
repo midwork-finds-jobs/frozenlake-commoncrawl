@@ -25,8 +25,7 @@
     # Nix files
     nixfmt-rfc-style.enable = true;
 
-    # Leaking secrets
-    trufflehog.enable = true;
+    # Stop leaking secrets
     ripsecrets.enable = true;
 
     # Python code
