@@ -26,11 +26,13 @@ def main():
     # Create DuckDB connection
     con = duckdb.connect()
 
+    # Flag for graceful shutdown
+    shutdown_requested = {'flag': False}
+
     # Set up signal handler for Ctrl+C
     def signal_handler(sig, frame):
-        print("\n\nInterrupted by user (Ctrl+C). Closing connection and exiting...")
-        con.close()
-        sys.exit(0)
+        print("\n\nInterrupt received (Ctrl+C). Finishing current operation and exiting...")
+        shutdown_requested['flag'] = True
 
     signal.signal(signal.SIGINT, signal_handler)
 
@@ -154,6 +156,10 @@ def main():
     if parquet_files_2013_2021:
         print(f"Adding {len(parquet_files_2013_2021)} files to CC_MAIN_2013_TO_2021...")
         for i, file_url in enumerate(parquet_files_2013_2021, 1):
+            if shutdown_requested['flag']:
+                print(f"  Stopped at file {i}/{len(parquet_files_2013_2021)}")
+                break
+
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2013_2021)}: {file_url}")
             try:
@@ -167,6 +173,11 @@ def main():
                 """, [file_url])
             except Exception as e:
                 print(f"  WARNING: Failed to add {file_url}: {e}")
+
+    if shutdown_requested['flag']:
+        print("\nShutdown requested. Closing connection and exiting...")
+        con.close()
+        sys.exit(0)
 
     # ========================================
     # Table 2: CC-MAIN-2021-49 onwards
@@ -190,6 +201,10 @@ def main():
     if parquet_files_2021_forward:
         print(f"Adding {len(parquet_files_2021_forward)} files to CC_MAIN_2021_AND_FORWARD...")
         for i, file_url in enumerate(parquet_files_2021_forward, 1):
+            if shutdown_requested['flag']:
+                print(f"  Stopped at file {i}/{len(parquet_files_2021_forward)}")
+                break
+
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2021_forward)}: {file_url}")
             try:
@@ -202,6 +217,11 @@ def main():
                 """, [file_url])
             except Exception as e:
                 print(f"  WARNING: Failed to add {file_url}: {e}")
+
+    if shutdown_requested['flag']:
+        print("\nShutdown requested. Closing connection and exiting...")
+        con.close()
+        sys.exit(0)
 
     # ========================================
     # Create unified view
