@@ -110,7 +110,7 @@ def main():
 
     # Attach DuckLake database
     print("Attaching DuckLake database...")
-    con.execute("ATTACH 'ducklake:commoncrawl.ducklake' AS commoncrawl (DATA_PATH 'tmp_always_empty')")
+    con.execute("ATTACH 'ducklake:commoncrawl_s3.ducklake' AS commoncrawl (DATA_PATH 'tmp_always_empty')")
 
     # Create tables with schemas from newest parquet files
     print("\n=== Creating table schemas ===")
@@ -261,7 +261,7 @@ def main():
     """)
 
     print("\n✓ DuckLake database created successfully!")
-    print("  Database: commoncrawl.ducklake")
+    print("  Database: commoncrawl_s3.ducklake")
     print("  View: commoncrawl.archives")
 
     con.close()
