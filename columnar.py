@@ -131,6 +131,7 @@ def main():
         WHERE table_schema = 'commoncrawl' AND table_name = 'CC_MAIN_2013_TO_2021'
     """).fetchall()
     existing_columns = {row[0].lower() for row in existing_columns}
+    print(f"  Existing columns: {sorted(existing_columns)}")
 
     if 'content_charset' not in existing_columns:
         print("  Adding missing column: content_charset")
