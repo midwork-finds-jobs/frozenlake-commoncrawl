@@ -49,7 +49,7 @@ def safe_add_file(con, table, url, cc_base):
     """Adds file to DuckLake with retry logic for 403s."""
     while not stop_signal:
         try:
-            con.execute(f"CALL ducklake_add_data_files('commoncrawl', '{table}', ['{cc_base}{url}'], allow_missing=>true)")
+            con.execute(f"CALL ducklake_add_data_files('commoncrawl', '{table}', '{cc_base}{url}', allow_missing=>true)")
             return True
         except Exception as e:
             if '403' in str(e):
