@@ -41,15 +41,9 @@ def determine_access_mode(mode):
         return S3_BASE, "ducklake:commoncrawl_s3.ducklake"
     elif mode == 'http':
         return HTTP_BASE, "ducklake:commoncrawl.ducklake"
-    else:  # auto
-        key_id = os.environ.get('AWS_ACCESS_KEY_ID')
-        secret_key = os.environ.get('AWS_SECRET_ACCESS_KEY')
-        if key_id and secret_key:
-            print("AWS credentials found. Using S3 access.")
-            return S3_BASE, "ducklake:commoncrawl_s3.ducklake"
-        else:
-            print("No AWS credentials. Using HTTP access (rate limited).")
-            return HTTP_BASE, "ducklake:commoncrawl.ducklake"
+    else:
+        print("You need to give access mode explicitly with --access-mode flag (s3 or http).")
+        exit(1)
 
 def safe_add_file(con, table, url, cc_base):
     """Adds file to DuckLake with retry logic for 403s."""
@@ -68,38 +62,74 @@ def safe_add_file(con, table, url, cc_base):
 
 def main():
     parser = argparse.ArgumentParser(description='Convert Common Crawl columnar index to DuckLake format.')
-    parser.add_argument('--access-mode', choices=['auto', 's3', 'http'], default='auto',
-                       help='Access mode: auto (detect from env), s3 (force S3), http (force HTTP)')
+    parser.add_argument('--access-mode', choices=['s3', 'http'], default='http',
+                       help='Access mode: s3 (force S3), http (force HTTP)')
     args = parser.parse_args()
 
     signal.signal(signal.SIGINT, handle_sigint)
-
-    cc_base, db_path = determine_access_mode(args.access_mode)
 
     print("Initializing DuckDB and extensions...")
     con = duckdb.connect()
     for ext in ['ducklake', 'httpfs', 'netquack']:
         con.execute(f"INSTALL {ext}; LOAD {ext};")
 
+    if args.access_mode == 's3':
+        cc_base, db_path = S3_BASE, "ducklake:commoncrawl_s3.ducklake"
+        
+        # Also login to S3
+        if not os.getenv('AWS_ACCESS_KEY_ID') or not os.getenv('AWS_SECRET_ACCESS_KEY'):
+            print("AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY env is missing!")
+            exit(1)
+        con.execute(f"""
+            CREATE SECRET IF NOT EXISTS commoncrawl_s3 (
+                TYPE S3,
+                KEY_ID '{os.getenv('AWS_ACCESS_KEY_ID')}',
+                SECRET '{os.getenv('AWS_SECRET_ACCESS_KEY')}',
+                REGION 'us-east-1'
+            )
+        """)
+        
+    elif args.access_mode == 'http':
+        cc_base, db_path = HTTP_BASE, "ducklake:commoncrawl.ducklake"
+
     # Optimization settings
-    con.execute("SET http_retries = 1000; SET http_retry_backoff = 6;")
+    con.execute("SET http_retries = 1000; SET http_retry_backoff = 6; SET http_retry_wait_ms = 500;")
     con.execute(f"ATTACH '{db_path}' AS commoncrawl (DATA_PATH 'tmp_always_empty')")
 
     # 1. Fetch Metadata & Generate File List
     print("Fetching metadata and generating file lists...")
+
+    # Add parquet files to temp tables
     con.execute(f"""
+        CREATE OR REPLACE TEMP TABLE crawl_info AS
+            FROM read_json('https://index.commoncrawl.org/collinfo.json')
+            WHERE id NOT IN (
+                -- Columnar index not available for the oldest crawls
+                'CC-MAIN-2012',
+                'CC-MAIN-2009-2010',
+                'CC-MAIN-2008-2009'
+            );
+
+        SET VARIABLE crawl_ids = (
+            SELECT ARRAY_AGG(id)
+            FROM crawl_info
+        );
+
         CREATE OR REPLACE TEMP TABLE all_files AS
-        WITH crawls AS (
-            SELECT id FROM read_json('https://index.commoncrawl.org/collinfo.json')
-            WHERE id NOT IN ('CC-MAIN-2012', 'CC-MAIN-2009-2010', 'CC-MAIN-2008-2009')
-        ),
-        paths AS (
-            SELECT id,
-                   format('{cc_base}/crawl-data/{{}}/cc-index-table.paths.gz', id) as path_url
-            FROM crawls
-        )
-        SELECT paths.id as crawl_id, column0 as file_path
-        FROM paths, read_csv(paths.path_url, header=false)
+            SELECT 
+                crawl_info.id as crawl_id,
+                csv.column0 as file_path
+            FROM read_csv(
+                list_transform(
+                    getvariable('crawl_ids'),
+                    n -> format(
+                        '{cc_base}/crawl-data/{{}}/cc-index-table.paths.gz',
+                        n
+                    )
+                ),
+                header=false
+            ) as csv
+            INNER JOIN crawl_info ON contains(column0, '/crawl=' || crawl_info.id || '/')
     """)
 
     # 2. Ensure Tables Exist (Schema Initialization)
