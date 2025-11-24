@@ -130,6 +130,10 @@ def main():
         WITH NO DATA
     """, [newest_parquet_file])
 
+    # TODO: command above doesn't include fetch_redirect column, add it manually
+    # Sample failing parquet: https://data.commoncrawl.org/cc-index/table/cc-main/warc/crawl=CC-MAIN-2021-31/subset=crawldiagnostics/part-00042-a23f1677-939c-4b0d-b187-713170151123.c000.gz.parquet
+    con.execute("ALTER TABLE commoncrawl.CC_MAIN_2021_AND_FORWARD ADD COLUMN fetch_redirect TYPE VARCHAR")
+
     # Get newest parquet file with old timestamp schema
     newest_parquet_file_old = con.execute("""
         SELECT MAX(url)
