@@ -46,12 +46,6 @@ def main():
     con.execute("INSTALL netquack FROM community")
     con.execute("LOAD netquack")
 
-    # Set HTTP retry parameters for reliability
-    print("Configuring HTTP settings...")
-    con.execute("SET http_retries = 1000")
-    con.execute("SET http_retry_backoff = 6")
-    con.execute("SET http_retry_wait_ms = 500")
-
     # Fetch crawl info (excluding oldest crawls without columnar index)
     # Use local file if it exists, otherwise fetch from URL
     collinfo_source = 'collinfo.json' if os.path.exists('collinfo.json') else 'https://index.commoncrawl.org/collinfo.json'
@@ -82,13 +76,19 @@ def main():
             list_transform(
                 getvariable('crawl_ids'),
                 n -> format(
-                    'https://data.commoncrawl.org/crawl-data/{}/cc-index-table.paths.gz',
+                    'https://ds5q9oxwqwsfj.cloudfront.net/crawl-data/{}/cc-index-table.paths.gz',
                     n
                 )
             ),
             header=false
         )
     """)
+
+    # Set HTTP retry parameters for reliability
+    print("Configuring HTTP settings...")
+    con.execute("SET http_retries = 1000")
+    con.execute("SET http_retry_backoff = 6")
+    con.execute("SET http_retry_wait_ms = 500")
 
     # Attach DuckLake database
     print("Attaching DuckLake database...")
