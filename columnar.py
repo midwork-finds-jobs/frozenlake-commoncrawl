@@ -158,6 +158,12 @@ def main():
         )
     """)
 
+    parquet_file_count = con.execute("""
+        SELECT COUNT(*)
+        FROM idempotent_parquet_files
+    """).fetchone()[0]
+    print(f"Total idempotentparquet files found: {parquet_file_count}")
+
     # ========================================
     # Table 1: CC-MAIN-2013-20 to CC-MAIN-2021-43
     # (years 2013-2023 without timezone in fetch_time)
