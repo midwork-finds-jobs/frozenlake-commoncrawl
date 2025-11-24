@@ -131,13 +131,10 @@ def main():
     existing_columns = {row[0].lower() for row in existing_columns}
     print(f"  Existing columns: {sorted(existing_columns)}")
 
-    if 'content_charset' not in existing_columns:
-        print("  Adding missing column: content_charset")
-        con.execute("ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN content_charset VARCHAR")
-
-    if 'fetch_redirect' not in existing_columns:
-        print("  Adding missing column: fetch_redirect")
-        con.execute("ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN fetch_redirect VARCHAR")
+    for col in ['content_languages', 'content_charset', 'fetch_redirect']:
+        if col not in existing_columns:
+            print(f"  Adding missing column: {col}")
+            con.execute(f"ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN {col} VARCHAR")
 
     # Create idempotent parquet files view (filters out already-added files)
     print("\n=== Creating idempotent file list ===")
