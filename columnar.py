@@ -142,7 +142,7 @@ def main():
     print("\n=== Creating idempotent file list ===")
     con.execute("""
         CREATE OR REPLACE TEMP VIEW idempotent_parquet_files AS (
-            SELECT extract_path(url) FROM crawl_parquet_files
+            SELECT extract_path(url) as url FROM crawl_parquet_files
             EXCEPT
             SELECT extract_path(data_file) as url
             FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2013_TO_2021')
