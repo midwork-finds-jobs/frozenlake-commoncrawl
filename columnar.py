@@ -88,7 +88,7 @@ def main():
                 REGION 'us-east-1'
             )
         """)
-        
+
     elif args.access_mode == 'http':
         cc_base, db_path = HTTP_BASE, "ducklake:commoncrawl.ducklake"
 
@@ -118,7 +118,7 @@ def main():
         CREATE OR REPLACE TEMP TABLE all_files AS
             SELECT 
                 crawl_info.id as crawl_id,
-                csv.column0 as file_path
+                '/' || csv.column0 as file_path
             FROM read_csv(
                 list_transform(
                     getvariable('crawl_ids'),
