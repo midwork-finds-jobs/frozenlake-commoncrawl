@@ -104,6 +104,12 @@ def main():
         )
     """)
 
+    parquet_file_count = con.execute("""
+        SELECT COUNT(*)
+        FROM crawl_parquet_files
+    """).fetchone()[0]
+    print(f"Total parquet files found: {parquet_file_count}")
+
     # Set HTTP retry parameters for reliability
     print("Configuring HTTP settings...")
     con.execute("SET http_retries = 1000")
