@@ -1,10 +1,16 @@
 # FrozeLake CommonCrawl
 
-Convert Common Crawl columnar index to a read only frozen DuckLake format for efficient querying.
+Convert Common Crawl columnar index to a read only frozen [DuckLake](https://ducklake.select/) for efficient querying.
 
-It referenced external files, download their parquet metadata and then store this parquet metadata into efficient ~150Mb blob to have faster access to all data in common crawl.
+As of 2025 November there are `88492` parquet files in the [Common Crawl columnar index](https://data.commoncrawl.org/cc-index/table/cc-main/index.html).
 
-It takes ~20 hours to run this (outside of AWS with 1Gbps connection) because [ducklake_add_data_files()](https://ducklake.select/docs/stable/duckdb/metadata/adding_files) calls are slow and can't be run in parallel:
+It would be neat if one would be able to query from all of them in efficient and ergonomic way.
+
+This script uses ducklake and [ducklake_add_data_files()](https://ducklake.select/docs/stable/duckdb/metadata/adding_files) calls to convert all of the files into a fast ~150Mb reference table to have easy access to all data in common crawl.
+
+It takes ~20 hours to run this (outside of AWS with 1Gbps connection) because ducklake_add_data_files() calls are slow and can't be run in parallel.
+
+**NOTE: Before this is actually usable [duckdb/ducklake#579](https://github.com/duckdb/ducklake/issues/579) needs to be solved. Currently ducklake doesn't use hive partitioning to skip reading files. Because of this ducklake reads metadata from all files even when it would not need to.**
 
 ```sql
 CALL ducklake_add_data_files(
