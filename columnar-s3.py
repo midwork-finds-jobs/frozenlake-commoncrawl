@@ -96,7 +96,7 @@ def main():
             list_transform(
                 getvariable('crawl_ids'),
                 n -> format(
-                    'https://data.commoncrawl.org/crawl-data/{}/cc-index-table.paths.gz',
+                    's3://commoncrawl/crawl-data/{}/cc-index-table.paths.gz',
                     n
                 )
             ),
