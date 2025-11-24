@@ -33,7 +33,14 @@ This project provides tools to fetch Common Crawl's columnar index data and orga
 Run with devenv:
 
 ```bash
-$ devenv shell ./columnar.py
+# Auto-detect access mode (checks AWS credentials)
+devenv shell ./columnar.py
+
+# Force S3 access (requires AWS credentials)
+devenv shell ./columnar.py --access-mode s3
+
+# Force HTTP access (rate limited, no credentials needed)
+devenv shell ./columnar.py --access-mode http
 ```
 
 Or manually with Python:
@@ -42,8 +49,14 @@ Or manually with Python:
 python3 -m venv .venv
 source .venv/bin/activate
 pip install duckdb
-python3 columnar.py
+python3 columnar.py --access-mode http
 ```
+
+### Access Modes
+
+- `auto` (default) - Auto-detects based on AWS credentials in environment
+- `s3` - Force S3 access (faster, requires AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY)
+- `http` - Force HTTP access (slower, rate limited, no credentials needed)
 
 ## Output
 
