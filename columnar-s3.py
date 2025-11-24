@@ -145,9 +145,22 @@ def main():
         WITH NO DATA
     """, [newest_parquet_file_old])
 
-    # TODO: command above doesn't include fetch_redirect column, add it manually
-    # Sample failing parquet: https://data.commoncrawl.org/cc-index/table/cc-main/warc/crawl=CC-MAIN-2021-31/subset=crawldiagnostics/part-00042-a23f1677-939c-4b0d-b187-713170151123.c000.gz.parquet
-    con.execute("ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN IF NOT EXISTS fetch_redirect VARCHAR")
+    # Ensure required columns exist (added in later crawls but missing in older schemas)
+    print("Checking for required columns in CC_MAIN_2013_TO_2021...")
+    existing_columns = con.execute("""
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = 'commoncrawl' AND table_name = 'CC_MAIN_2013_TO_2021'
+    """).fetchall()
+    existing_columns = {row[0] for row in existing_columns}
+
+    if 'content_charset' not in existing_columns:
+        print("  Adding missing column: content_charset")
+        con.execute("ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN content_charset VARCHAR")
+
+    if 'fetch_redirect' not in existing_columns:
+        print("  Adding missing column: fetch_redirect")
+        con.execute("ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN fetch_redirect VARCHAR")
 
     # Create idempotent parquet files view (filters out already-added files)
     print("\n=== Creating idempotent file list ===")
