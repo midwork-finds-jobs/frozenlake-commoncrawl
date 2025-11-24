@@ -80,11 +80,11 @@ def main():
         if not os.getenv('AWS_ACCESS_KEY_ID') or not os.getenv('AWS_SECRET_ACCESS_KEY'):
             print("AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY env is missing!")
             exit(1)
-        con.execute(f"""
+        con.execute("""
             CREATE SECRET IF NOT EXISTS commoncrawl_s3 (
                 TYPE S3,
-                KEY_ID '{os.getenv('AWS_ACCESS_KEY_ID')}',
-                SECRET '{os.getenv('AWS_SECRET_ACCESS_KEY')}',
+                KEY_ID getenv('AWS_ACCESS_KEY_ID'),
+                SECRET getenv('AWS_SECRET_ACCESS_KEY'),
                 REGION 'us-east-1'
             )
         """)
@@ -139,11 +139,11 @@ def main():
     sample_new = con.sql(f"SELECT max(file_path) FROM all_files WHERE crawl_id >= '{SCHEMA_CHANGE_ID}'").fetchone()[0]
     sample_old = con.sql(f"SELECT max(file_path) FROM all_files WHERE crawl_id < '{SCHEMA_CHANGE_ID}'").fetchone()[0]
 
-    con.execute(f"CREATE TABLE IF NOT EXISTS commoncrawl.{TABLE_NEW} AS FROM read_parquet('{cc_base}{sample_new}') LIMIT 0")
-    con.execute(f"CREATE TABLE IF NOT EXISTS commoncrawl.{TABLE_OLD} AS FROM read_parquet('{cc_base}{sample_old}') LIMIT 0")
+    con.execute(f"CREATE TABLE IF NOT EXISTS commoncrawl.{TABLE_NEW} AS FROM read_parquet('{cc_base}{sample_new}') WITH NO DATA")
+    con.execute(f"CREATE TABLE IF NOT EXISTS commoncrawl.{TABLE_OLD} AS FROM read_parquet('{cc_base}{sample_old}') WITH NO DATA")
 
     # Patch older schema with missing columns if necessary
-    for col in ['content_languages', 'content_charset', 'fetch_redirect']:
+    for col in ['content_languages', 'content_charset', 'fetch_redirect', 'content_truncated']:
         try:
             con.execute(f"ALTER TABLE commoncrawl.{TABLE_OLD} ADD COLUMN {col} VARCHAR")
             print(f"  Added missing column: {col}")
