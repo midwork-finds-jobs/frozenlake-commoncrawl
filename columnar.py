@@ -203,7 +203,7 @@ def main():
 
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2013_2021)}: {file_url}")
-            retry_delay = 1
+            fib_a, fib_b = 1, 1
             while True:
                 try:
                     con.execute("""
@@ -217,9 +217,10 @@ def main():
                     break
                 except Exception as e:
                     if '403 (Forbidden)' in str(e):
+                        retry_delay = min(fib_a, 600)  # Cap at 10 minutes
                         print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 300)  # Cap at 5 minutes
+                        fib_a, fib_b = fib_b, fib_a + fib_b
                     else:
                         print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
                         break
@@ -257,7 +258,7 @@ def main():
 
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2021_forward)}: {file_url}")
-            retry_delay = 1
+            fib_a, fib_b = 1, 1
             while True:
                 try:
                     con.execute("""
@@ -270,13 +271,14 @@ def main():
                     break
                 except Exception as e:
                     if '403 (Forbidden)' in str(e):
+                        retry_delay = min(fib_a, 300)  # Cap at 5 minutes
                         print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, 300)  # Cap at 5 minutes
+                        fib_a, fib_b = fib_b, fib_a + fib_b
                     else:
                         print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
                         print("Trying through: https://ds5q9oxwqwsfj.cloudfront.net")
-                        retry_delay_cf = 1
+                        fib_cf_a, fib_cf_b = 1, 1
                         while True:
                             try:
                                 con.execute("""
@@ -290,9 +292,10 @@ def main():
                                 break
                             except Exception as e2:
                                 if '403 (Forbidden)' in str(e2):
+                                    retry_delay_cf = min(fib_cf_a, 300)
                                     print(f"  403 Forbidden (CloudFront) for {file_url}, retrying in {retry_delay_cf}s...")
                                     time.sleep(retry_delay_cf)
-                                    retry_delay_cf = min(retry_delay_cf * 2, 300)
+                                    fib_cf_a, fib_cf_b = fib_cf_b, fib_cf_a + fib_cf_b
                                 else:
                                     print(f"  WARNING: Also failed to add via CloudFront: {e2}")
                                     break
