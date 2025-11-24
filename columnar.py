@@ -1,313 +1,142 @@
 #!/usr/bin/env python
 """
 Convert Common Crawl columnar index to DuckLake format.
-
-This script:
-1. Fetches crawl metadata from Common Crawl
-2. Downloads parquet file lists for each crawl
-3. Creates DuckLake tables organized by schema changes
-4. Iteratively adds data files to DuckLake
-
-Requirements:
-  pip install duckdb
-
-Or run with virtual environment:
-  python3 -m venv .venv
-  source .venv/bin/activate
-  pip install duckdb
-  python3 columnar.py
 """
 
 import duckdb
-import signal
-import sys
 import os
 import time
+import signal
+
+# Configuration
+DB_PATH = "ducklake:commoncrawl.ducklake"
+# Crawl ID where the schema changed (timestamp format)
+SCHEMA_CHANGE_ID = "CC-MAIN-2021-49"
+TABLE_OLD = "CC_MAIN_2013_TO_2021"
+TABLE_NEW = "CC_MAIN_2021_AND_FORWARD"
+
+CC_BASE = "https://data.commoncrawl.org"
+S3_BUCKET_BASE = "s3://commoncrawl"
+
+# 1. Environment Verification
+KEY_ID = os.environ.get('AWS_ACCESS_KEY_ID')
+SECRET_KEY = os.environ.get('AWS_SECRET_ACCESS_KEY')
+
+if KEY_ID and SECRET_KEY:
+    print("AWS credentials found. Using S3 access for Common Crawl data.")
+    CC_BASE = S3_BUCKET_BASE
+    DB_PATH = "ducklake:commoncrawl_s3.ducklake"
+else:
+    print("No AWS credentials found. Using rate limited HTTP access for Common Crawl data.")
+
+stop_signal = False
+
+def handle_sigint(signum, frame):
+    global stop_signal
+    print("\nStopping gracefully...")
+    stop_signal = True
+
+def safe_add_file(con, table, url):
+    """Adds file to DuckLake with retry logic for 403s."""
+    while not stop_signal:
+        try:
+            con.execute(f"CALL ducklake_add_data_files('commoncrawl', '{table}', ['{CC_BASE}{url}'], allow_missing=>true)")
+            return True
+        except Exception as e:
+            if '403' in str(e):
+                print(f"  [403 Forbidden] Retrying {url} in 255s...")
+                time.sleep(255)
+            else:
+                print(f"  [Error] Failed {url}: {e}")
+                return False
+    return False
 
 def main():
-    # Create DuckDB connection
+    signal.signal(signal.SIGINT, handle_sigint)
+    
+    print("Initializing DuckDB and extensions...")
     con = duckdb.connect()
+    for ext in ['ducklake', 'httpfs', 'netquack']:
+        con.execute(f"INSTALL {ext}; LOAD {ext};")
+    
+    # Optimization settings
+    con.execute("SET http_retries = 1000; SET http_retry_backoff = 6;")
+    con.execute(f"ATTACH '{DB_PATH}' AS commoncrawl (DATA_PATH 'tmp_always_empty')")
 
-    # Flag for graceful shutdown
-    shutdown_requested = {'flag': False}
-
-    # Set up signal handler for Ctrl+C
-    def signal_handler(sig, frame):
-        print("\n\nInterrupt received (Ctrl+C). Finishing current operation and exiting...")
-        shutdown_requested['flag'] = True
-
-    signal.signal(signal.SIGINT, signal_handler)
-
-    # Install and load extensions
-    print("Installing extensions...")
-    con.execute("INSTALL ducklake")
-    con.execute("LOAD ducklake")
-    con.execute("INSTALL httpfs")
-    con.execute("LOAD httpfs")
-    con.execute("INSTALL netquack FROM community")
-    con.execute("LOAD netquack")
-
-    # Fetch crawl info (excluding oldest crawls without columnar index)
-    # Use local file if it exists, otherwise fetch from URL
-    collinfo_source = 'collinfo.json' if os.path.exists('collinfo.json') else 'https://index.commoncrawl.org/collinfo.json'
-    print(f"Fetching crawl metadata from {collinfo_source}...")
+    # 1. Fetch Metadata & Generate File List
+    print("Fetching metadata and generating file lists...")
     con.execute("""
-        CREATE OR REPLACE TEMP TABLE crawl_info AS
-        FROM read_json(?)
-        WHERE id NOT IN (
-            'CC-MAIN-2012',
-            'CC-MAIN-2009-2010',
-            'CC-MAIN-2008-2009'
+        CREATE OR REPLACE TEMP TABLE all_files AS
+        WITH crawls AS (
+            SELECT id FROM read_json('https://index.commoncrawl.org/collinfo.json')
+            WHERE id NOT IN ('CC-MAIN-2012', 'CC-MAIN-2009-2010', 'CC-MAIN-2008-2009')
+        ),
+        paths AS (
+            SELECT id, 
+                   format('?/crawl-data/{}/cc-index-table.paths.gz', id) as path_url
+            FROM crawls
         )
-    """, [collinfo_source])
+        SELECT paths.id as crawl_id, column0 as file_path
+        FROM paths, read_csv(paths.path_url, header=false)
+    """, [CC_BASE])
 
-    # Get list of crawl IDs
-    crawl_ids = con.execute("SELECT id FROM crawl_info ORDER BY id").fetchall()
-    crawl_ids = [row[0] for row in crawl_ids]
+    # 2. Ensure Tables Exist (Schema Initialization)
+    print("Ensuring table schemas...")
+    
+    # Get sample files to initialize schemas if tables don't exist
+    sample_new = con.sql(f"SELECT max(file_path) FROM all_files WHERE crawl_id >= '{SCHEMA_CHANGE_ID}'").fetchone()[0]
+    sample_old = con.sql(f"SELECT max(file_path) FROM all_files WHERE crawl_id < '{SCHEMA_CHANGE_ID}'").fetchone()[0]
 
-    print(f"Found {len(crawl_ids)} crawls to process")
+    con.execute(f"CREATE TABLE IF NOT EXISTS commoncrawl.{TABLE_NEW} AS FROM read_parquet('{CC_BASE}{sample_new}') LIMIT 0")
+    con.execute(f"CREATE TABLE IF NOT EXISTS commoncrawl.{TABLE_OLD} AS FROM read_parquet('{CC_BASE}{sample_old}') LIMIT 0")
 
-    # Generate parquet file URLs for all crawls
-    print("Generating parquet file lists...")
-    con.execute("SET VARIABLE crawl_ids = ?", [crawl_ids])
-    con.execute("""
-        CREATE OR REPLACE TEMP TABLE crawl_parquet_files AS
-        SELECT 'https://data.commoncrawl.org/' || column0 as url
-        FROM read_csv(
-            list_transform(
-                getvariable('crawl_ids'),
-                n -> format(
-                    'https://ds5q9oxwqwsfj.cloudfront.net/crawl-data/{}/cc-index-table.paths.gz',
-                    n
-                )
-            ),
-            header=false
-        )
-    """)
-
-    parquet_file_count = con.execute("""
-        SELECT COUNT(*)
-        FROM crawl_parquet_files
-    """).fetchone()[0]
-    print(f"Total parquet files found: {parquet_file_count}")
-
-    # Set HTTP retry parameters for reliability
-    print("Configuring HTTP settings...")
-    con.execute("SET http_retries = 1000")
-    con.execute("SET http_retry_backoff = 6")
-    con.execute("SET http_retry_wait_ms = 500")
-
-    # Attach DuckLake database
-    print("Attaching DuckLake database...")
-    con.execute("ATTACH 'ducklake:commoncrawl.ducklake' AS commoncrawl (DATA_PATH 'tmp_always_empty')")
-
-    # Create tables with schemas from newest parquet files
-    print("\n=== Creating table schemas ===")
-
-    # Get newest parquet file for CC_MAIN_2021_AND_FORWARD
-    newest_parquet_file = con.execute("""
-        SELECT MAX(url)
-        FROM crawl_parquet_files
-    """).fetchone()[0]
-
-    print(f"Creating CC_MAIN_2021_AND_FORWARD schema from: {newest_parquet_file}")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS commoncrawl.CC_MAIN_2021_AND_FORWARD AS
-        FROM read_parquet(?)
-        WITH NO DATA
-    """, [newest_parquet_file])
-
-    # Get newest parquet file with old timestamp schema
-    newest_parquet_file_old = con.execute("""
-        SELECT MAX(url)
-        FROM crawl_parquet_files
-        INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
-        WHERE crawl_info.id = 'CC-MAIN-2021-43'
-    """).fetchone()[0]
-
-    print(f"Creating CC_MAIN_2013_TO_2021 schema from: {newest_parquet_file_old}")
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS commoncrawl.CC_MAIN_2013_TO_2021 AS
-        FROM read_parquet(?)
-        WITH NO DATA
-    """, [newest_parquet_file_old])
-
-    # Ensure required columns exist (added in later crawls but missing in older schemas)
-    print("Checking for required columns in CC_MAIN_2013_TO_2021...")
-    existing_columns = con.execute("""
-        SELECT column_name FROM (DESCRIBE FROM commoncrawl.CC_MAIN_2013_TO_2021)
-    """).fetchall()
-    existing_columns = {row[0].lower() for row in existing_columns}
-    print(f"  Existing columns: {sorted(existing_columns)}")
-
+    # Patch older schema with missing columns if necessary
     for col in ['content_languages', 'content_charset', 'fetch_redirect']:
-        if col not in existing_columns:
-            print(f"  Adding missing column: {col}")
-            con.execute(f"ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN {col} VARCHAR")
+        try:
+            con.execute(f"ALTER TABLE commoncrawl.{TABLE_OLD} ADD COLUMN {col} VARCHAR")
+            print(f"  Added missing column: {col}")
+        except duckdb.Error:
+            pass  # Column likely exists
 
-    # Create idempotent parquet files view (filters out already-added files)
-    print("\n=== Creating idempotent file list ===")
-    con.execute("""
-        CREATE OR REPLACE TEMP VIEW idempotent_parquet_files AS (
-            SELECT extract_path(url) as url FROM crawl_parquet_files
-            EXCEPT
-            SELECT extract_path(data_file) as url
-            FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2013_TO_2021')
-            EXCEPT
-            SELECT extract_path(data_file) as url
-            FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2021_AND_FORWARD')
+    # 3. Calculate Delta (Files to process)
+    print("Calculating missing files...")
+    files_to_process = con.execute(f"""
+        SELECT crawl_id, file_path 
+        FROM all_files
+        WHERE extract_path(file_path) NOT IN (
+            SELECT extract_path(data_file) FROM ducklake_list_files('commoncrawl', '{TABLE_OLD}')
+            UNION ALL
+            SELECT extract_path(data_file) FROM ducklake_list_files('commoncrawl', '{TABLE_NEW}')
         )
-    """)
-
-    parquet_file_count = con.execute("""
-        SELECT COUNT(*)
-        FROM idempotent_parquet_files
-    """).fetchone()[0]
-    print(f"Total idempotentparquet files found: {parquet_file_count}")
-
-    # Print sample of idempotent files
-    sample_files = con.execute("""
-        SELECT url
-        FROM idempotent_parquet_files
-        LIMIT 5
-    """).fetchall()
-    print("Sample idempotent parquet files:")
-    for row in sample_files:
-        print(f"  {row[0]}")
-
-    # ========================================
-    # Table 1: CC-MAIN-2013-20 to CC-MAIN-2021-43
-    # (years 2013-2023 without timezone in fetch_time)
-    # ========================================
-    print("\n=== Processing CC-MAIN-2013-20 to CC-MAIN-2021-43 ===")
-
-    # Get parquet files for this period (already filtered by idempotent view)
-    parquet_files_2013_2021 = con.execute("""
-        SELECT REPLACE(url, lower(crawl_info.id), crawl_info.id) as url
-        FROM idempotent_parquet_files
-        INNER JOIN crawl_info ON contains(lower(url), '/crawl=' || lower(crawl_info.id) || '/')
-        WHERE id BETWEEN 'CC-MAIN-2013-20' AND 'CC-MAIN-2021-43'
-        ORDER BY url
+        ORDER BY crawl_id, file_path
     """).fetchall()
 
-    parquet_files_2013_2021 = [row[0] for row in parquet_files_2013_2021]
-    print(f"Found {len(parquet_files_2013_2021)} new parquet files to add for 2013-2021 period")
+    total = len(files_to_process)
+    print(f"Found {total} new files to process.")
 
-    # Add each file to DuckLake
-    if parquet_files_2013_2021:
-        print(f"Adding {len(parquet_files_2013_2021)} files to CC_MAIN_2013_TO_2021...")
-        for i, file_url in enumerate(parquet_files_2013_2021, 1):
-            if shutdown_requested['flag']:
-                print(f"  Stopped at file {i}/{len(parquet_files_2013_2021)}")
-                break
+    # 4. Processing Loop
+    for i, (crawl_id, file_path) in enumerate(files_to_process, 1):
+        if stop_signal:
+            break
+        
+        target_table = TABLE_NEW if crawl_id >= SCHEMA_CHANGE_ID else TABLE_OLD
+        
+        if i % 10 == 0 or i == 1:
+            print(f"[{i}/{total}] Adding to {target_table}: {file_path}")
+            
+        safe_add_file(con, target_table, file_path)
 
-            if i % 10 == 0 or i == 1:
-                print(f"  Adding file {i}/{len(parquet_files_2013_2021)}: {file_url}")
-            while True:
-                try:
-                    con.execute("""
-                        CALL ducklake_add_data_files(
-                            'commoncrawl',
-                            'CC_MAIN_2013_TO_2021',
-                            ?,
-                            allow_missing => true
-                        )
-                    """, [f"https://data.commoncrawl.org{file_url}"])
-                    break
-                except Exception as e:
-                    if '403 (Forbidden)' in str(e):
-                        if shutdown_requested['flag']:
-                            break
-                        retry_delay = 255
-                        print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
-                        time.sleep(retry_delay)
-                    else:
-                        print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
-                        break
-
-    if shutdown_requested['flag']:
-        print("\nShutdown requested. Closing connection and exiting...")
-        con.close()
-        sys.exit(0)
-
-    # ========================================
-    # Table 2: CC-MAIN-2021-49 onwards
-    # (fetch_time has timezone info)
-    # ========================================
-    print("\n=== Processing CC-MAIN-2021-49 onwards ===")
-
-    # Get parquet files for this period (already filtered by idempotent view)
-    parquet_files_2021_forward = con.execute("""
-        SELECT REPLACE(url, lower(crawl_info.id), crawl_info.id) as url
-        FROM idempotent_parquet_files
-        INNER JOIN crawl_info ON contains(lower(url), '/crawl=' || lower(crawl_info.id) || '/')
-        WHERE id >= 'CC-MAIN-2021-49'
-        ORDER BY url
-    """).fetchall()
-
-    parquet_files_2021_forward = [row[0] for row in parquet_files_2021_forward]
-    print(f"Found {len(parquet_files_2021_forward)} new parquet files to add for 2021-forward period")
-
-    # Add each file to DuckLake
-    if parquet_files_2021_forward:
-        print(f"Adding {len(parquet_files_2021_forward)} files to CC_MAIN_2021_AND_FORWARD...")
-        for i, file_url in enumerate(parquet_files_2021_forward, 1):
-            if shutdown_requested['flag']:
-                print(f"  Stopped at file {i}/{len(parquet_files_2021_forward)}")
-                break
-
-            if i % 10 == 0 or i == 1:
-                print(f"  Adding file {i}/{len(parquet_files_2021_forward)}: {file_url}")
-            while True:
-                try:
-                    con.execute("""
-                        CALL ducklake_add_data_files(
-                            'commoncrawl',
-                            'CC_MAIN_2021_AND_FORWARD',
-                            ?,
-                            allow_missing => true
-                        )
-                    """, [f"https://data.commoncrawl.org{file_url}"])
-                    break
-                except Exception as e:
-                    if '403 (Forbidden)' in str(e):
-                        if shutdown_requested['flag']:
-                            break
-                        retry_delay = 255
-                        print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
-                        time.sleep(retry_delay)
-                    else:
-                        print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
-                        break
-
-    if shutdown_requested['flag']:
-        print("\nShutdown requested. Closing connection and exiting...")
-        con.close()
-        sys.exit(0)
-
-    # ========================================
-    # Create unified view
-    # ========================================
-    print("\n=== Creating unified view ===")
-    con.execute("""
+    # 5. Final View
+    print("\nUpdating unified view...")
+    con.execute(f"""
         CREATE OR REPLACE VIEW commoncrawl.archives AS
-        SELECT *
-        FROM commoncrawl.CC_MAIN_2021_AND_FORWARD
+        SELECT * FROM commoncrawl.{TABLE_NEW}
         UNION ALL BY NAME
-        -- Add UTC timezone to fetch_time for older data
-        SELECT * REPLACE (fetch_time::TIMESTAMPTZ AS fetch_time)
-        FROM commoncrawl.CC_MAIN_2013_TO_2021
+        SELECT * REPLACE (fetch_time::TIMESTAMPTZ AS fetch_time) FROM commoncrawl.{TABLE_OLD}
     """)
-
-    print("\n✓ DuckLake database created successfully!")
-    print("  Database: commoncrawl.ducklake")
-    print("  View: commoncrawl.archives")
-
+    
     con.close()
+    print("Done.")
 
 if __name__ == "__main__":
-    try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\nInterrupted by user (Ctrl+C). Exiting gracefully...")
-        exit(0)
+    main()
