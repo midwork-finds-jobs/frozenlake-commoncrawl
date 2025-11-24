@@ -87,7 +87,7 @@ def main():
 
     # 1. Fetch Metadata & Generate File List
     print("Fetching metadata and generating file lists...")
-    con.execute("""
+    con.execute(f"""
         CREATE OR REPLACE TEMP TABLE all_files AS
         WITH crawls AS (
             SELECT id FROM read_json('https://index.commoncrawl.org/collinfo.json')
@@ -95,12 +95,12 @@ def main():
         ),
         paths AS (
             SELECT id,
-                   format('?/crawl-data/{}/cc-index-table.paths.gz', id) as path_url
+                   format('{cc_base}/crawl-data/{{}}/cc-index-table.paths.gz', id) as path_url
             FROM crawls
         )
         SELECT paths.id as crawl_id, column0 as file_path
         FROM paths, read_csv(paths.path_url, header=false)
-    """, [cc_base])
+    """)
 
     # 2. Ensure Tables Exist (Schema Initialization)
     print("Ensuring table schemas...")
