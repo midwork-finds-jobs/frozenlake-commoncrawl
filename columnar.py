@@ -22,6 +22,7 @@ import duckdb
 import signal
 import sys
 import os
+import time
 
 def main():
     # Create DuckDB connection
@@ -202,18 +203,8 @@ def main():
 
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2013_2021)}: {file_url}")
-            try:
-                con.execute("""
-                    CALL ducklake_add_data_files(
-                        'commoncrawl',
-                        'CC_MAIN_2013_TO_2021',
-                        ?,
-                        allow_missing => true
-                    )
-                """, [f"https://data.commoncrawl.org{file_url}"])
-            except Exception as e:
-                print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
-                print("Trying through: https://ds5q9oxwqwsfj.cloudfront.net")
+            retry_delay = 1
+            while True:
                 try:
                     con.execute("""
                         CALL ducklake_add_data_files(
@@ -222,9 +213,16 @@ def main():
                             ?,
                             allow_missing => true
                         )
-                    """, [f"https://ds5q9oxwqwsfj.cloudfront.net{file_url}"])
-                except Exception as e2:
-                    print(f"  WARNING: Also failed to add via CloudFront: {e2}")
+                    """, [f"https://data.commoncrawl.org{file_url}"])
+                    break
+                except Exception as e:
+                    if '403 (Forbidden)' in str(e):
+                        print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, 300)  # Cap at 5 minutes
+                    else:
+                        print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
+                        break
 
     if shutdown_requested['flag']:
         print("\nShutdown requested. Closing connection and exiting...")
@@ -259,28 +257,46 @@ def main():
 
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2021_forward)}: {file_url}")
-            try:
-                con.execute("""
-                    CALL ducklake_add_data_files(
-                        'commoncrawl',
-                        'CC_MAIN_2021_AND_FORWARD',
-                        ?
-                    )
-                """, [f"https://data.commoncrawl.org{file_url}"])
-            except Exception as e:
-                print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
-                print("Trying through: https://ds5q9oxwqwsfj.cloudfront.net")
+            retry_delay = 1
+            while True:
                 try:
                     con.execute("""
                         CALL ducklake_add_data_files(
                             'commoncrawl',
                             'CC_MAIN_2021_AND_FORWARD',
-                            ?,
-                            allow_missing => true
+                            ?
                         )
-                    """, [f"https://ds5q9oxwqwsfj.cloudfront.net{file_url}"])
-                except Exception as e2:
-                    print(f"  WARNING: Also failed to add via CloudFront: {e2}")
+                    """, [f"https://data.commoncrawl.org{file_url}"])
+                    break
+                except Exception as e:
+                    if '403 (Forbidden)' in str(e):
+                        print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
+                        time.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, 300)  # Cap at 5 minutes
+                    else:
+                        print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
+                        print("Trying through: https://ds5q9oxwqwsfj.cloudfront.net")
+                        retry_delay_cf = 1
+                        while True:
+                            try:
+                                con.execute("""
+                                    CALL ducklake_add_data_files(
+                                        'commoncrawl',
+                                        'CC_MAIN_2021_AND_FORWARD',
+                                        ?,
+                                        allow_missing => true
+                                    )
+                                """, [f"https://ds5q9oxwqwsfj.cloudfront.net{file_url}"])
+                                break
+                            except Exception as e2:
+                                if '403 (Forbidden)' in str(e2):
+                                    print(f"  403 Forbidden (CloudFront) for {file_url}, retrying in {retry_delay_cf}s...")
+                                    time.sleep(retry_delay_cf)
+                                    retry_delay_cf = min(retry_delay_cf * 2, 300)
+                                else:
+                                    print(f"  WARNING: Also failed to add via CloudFront: {e2}")
+                                    break
+                        break
 
     if shutdown_requested['flag']:
         print("\nShutdown requested. Closing connection and exiting...")
