@@ -99,10 +99,16 @@ def main():
     # 1. Fetch Metadata & Generate File List
     print("Fetching metadata and generating file lists...")
 
+    # check if collinfo.json file exists locally with python
+    if os.path.exists('./collinfo.json'):
+        collinfo = './collinfo.json'
+    else:
+        collinfo = 'https://index.commoncrawl.org/collinfo.json'
+
     # Add parquet files to temp tables
     con.execute(f"""
         CREATE OR REPLACE TEMP TABLE crawl_info AS
-            FROM read_json('https://index.commoncrawl.org/collinfo.json')
+            FROM read_json('{collinfo}')
             WHERE id NOT IN (
                 -- Columnar index not available for the oldest crawls
                 'CC-MAIN-2012',
