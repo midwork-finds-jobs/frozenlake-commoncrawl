@@ -24,6 +24,17 @@ def handle_sigint(signum, frame):
     print("\nStopping gracefully...")
     stop_signal = True
 
+def interruptible_sleep(seconds):
+    """Sleep that can be interrupted by stop_signal or KeyboardInterrupt."""
+    for i in range(seconds):
+        if stop_signal:
+            break
+        try:
+            time.sleep(1)
+        except KeyboardInterrupt:
+            print("\nKeyboard interrupt received. Stopping...")
+            break
+
 def determine_access_mode(mode):
     """Determine access mode (s3 or http) based on CLI flag and environment."""
     if mode == 's3':
@@ -49,7 +60,7 @@ def safe_add_file(con, table, url, cc_base):
         except Exception as e:
             if '403' in str(e):
                 print(f"  [403 Forbidden] Retrying {url} in 255s...")
-                time.sleep(255)
+                interruptible_sleep(255)
             else:
                 print(f"  [Error] Failed {url}: {e}")
                 return False
