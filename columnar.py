@@ -182,7 +182,7 @@ def main():
 
     # Get parquet files for this period (already filtered by idempotent view)
     parquet_files_2013_2021 = con.execute("""
-        SELECT url
+        SELECT REPLACE(url, lower(crawl_info.id), crawl_info.id) as url
         FROM idempotent_parquet_files
         INNER JOIN crawl_info ON contains(lower(url), '/crawl=' || lower(crawl_info.id) || '/')
         WHERE id BETWEEN 'CC-MAIN-2013-20' AND 'CC-MAIN-2021-43'
@@ -239,7 +239,7 @@ def main():
 
     # Get parquet files for this period (already filtered by idempotent view)
     parquet_files_2021_forward = con.execute("""
-        SELECT url
+        SELECT REPLACE(url, lower(crawl_info.id), crawl_info.id) as url
         FROM idempotent_parquet_files
         INNER JOIN crawl_info ON contains(lower(url), '/crawl=' || lower(crawl_info.id) || '/')
         WHERE id >= 'CC-MAIN-2021-49'
