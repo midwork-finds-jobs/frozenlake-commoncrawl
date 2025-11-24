@@ -203,7 +203,6 @@ def main():
 
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2013_2021)}: {file_url}")
-            fib_a, fib_b = 1, 1
             while True:
                 try:
                     con.execute("""
@@ -217,6 +216,8 @@ def main():
                     break
                 except Exception as e:
                     if '403 (Forbidden)' in str(e):
+                        if shutdown_requested['flag']:
+                            break
                         retry_delay = 255
                         print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
@@ -257,47 +258,26 @@ def main():
 
             if i % 10 == 0 or i == 1:
                 print(f"  Adding file {i}/{len(parquet_files_2021_forward)}: {file_url}")
-            fib_a, fib_b = 1, 1
             while True:
                 try:
                     con.execute("""
                         CALL ducklake_add_data_files(
                             'commoncrawl',
                             'CC_MAIN_2021_AND_FORWARD',
-                            ?
+                            ?,
+                            allow_missing => true
                         )
                     """, [f"https://data.commoncrawl.org{file_url}"])
                     break
                 except Exception as e:
                     if '403 (Forbidden)' in str(e):
-                        retry_delay = min(fib_a, 300)  # Cap at 5 minutes
+                        if shutdown_requested['flag']:
+                            break
+                        retry_delay = 255
                         print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
-                        fib_a, fib_b = fib_b, fib_a + fib_b
                     else:
                         print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
-                        print("Trying through: https://ds5q9oxwqwsfj.cloudfront.net")
-                        fib_cf_a, fib_cf_b = 1, 1
-                        while True:
-                            try:
-                                con.execute("""
-                                    CALL ducklake_add_data_files(
-                                        'commoncrawl',
-                                        'CC_MAIN_2021_AND_FORWARD',
-                                        ?,
-                                        allow_missing => true
-                                    )
-                                """, [f"https://ds5q9oxwqwsfj.cloudfront.net{file_url}"])
-                                break
-                            except Exception as e2:
-                                if '403 (Forbidden)' in str(e2):
-                                    retry_delay_cf = min(fib_cf_a, 300)
-                                    print(f"  403 Forbidden (CloudFront) for {file_url}, retrying in {retry_delay_cf}s...")
-                                    time.sleep(retry_delay_cf)
-                                    fib_cf_a, fib_cf_b = fib_cf_b, fib_cf_a + fib_cf_b
-                                else:
-                                    print(f"  WARNING: Also failed to add via CloudFront: {e2}")
-                                    break
                         break
 
     if shutdown_requested['flag']:
