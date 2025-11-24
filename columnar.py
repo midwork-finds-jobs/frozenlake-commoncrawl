@@ -125,7 +125,7 @@ def main():
 
     # TODO: command above doesn't include fetch_redirect column, add it manually
     # Sample failing parquet: https://data.commoncrawl.org/cc-index/table/cc-main/warc/crawl=CC-MAIN-2021-31/subset=crawldiagnostics/part-00042-a23f1677-939c-4b0d-b187-713170151123.c000.gz.parquet
-    con.execute("ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN fetch_redirect TYPE VARCHAR")
+    con.execute("ALTER TABLE commoncrawl.CC_MAIN_2013_TO_2021 ADD COLUMN fetch_redirect VARCHAR")
 
     # Create idempotent parquet files view (filters out already-added files)
     print("\n=== Creating idempotent file list ===")
