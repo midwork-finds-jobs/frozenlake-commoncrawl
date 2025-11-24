@@ -43,6 +43,8 @@ def main():
     con.execute("LOAD ducklake")
     con.execute("INSTALL httpfs")
     con.execute("LOAD httpfs")
+    con.execute("INSTALL netquack FROM community")
+    con.execute("LOAD netquack")
 
     # Set HTTP retry parameters for reliability
     print("Configuring HTTP settings...")
@@ -140,12 +142,12 @@ def main():
     print("\n=== Creating idempotent file list ===")
     con.execute("""
         CREATE OR REPLACE TEMP VIEW idempotent_parquet_files AS (
-            SELECT url FROM crawl_parquet_files
+            SELECT extract_path(url) FROM crawl_parquet_files
             EXCEPT
-            SELECT data_file as url
+            SELECT extract_path(data_file) as url
             FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2013_TO_2021')
             EXCEPT
-            SELECT data_file as url
+            SELECT extract_path(data_file) as url
             FROM ducklake_list_files('commoncrawl', 'CC_MAIN_2021_AND_FORWARD')
         )
     """)
@@ -186,9 +188,21 @@ def main():
                         ?,
                         allow_missing => true
                     )
-                """, [file_url])
+                """, [f"https://data.commoncrawl.org{file_url}"])
             except Exception as e:
-                print(f"  WARNING: Failed to add {file_url}: {e}")
+                print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
+                print("Trying through: https://ds5q9oxwqwsfj.cloudfront.net")
+                try:
+                    con.execute("""
+                        CALL ducklake_add_data_files(
+                            'commoncrawl',
+                            'CC_MAIN_2013_TO_2021',
+                            ?,
+                            allow_missing => true
+                        )
+                    """, [f"https://ds5q9oxwqwsfj.cloudfront.net{file_url}"])
+                except Exception as e2:
+                    print(f"  WARNING: Also failed to add via CloudFront: {e2}")
 
     if shutdown_requested['flag']:
         print("\nShutdown requested. Closing connection and exiting...")
@@ -230,9 +244,21 @@ def main():
                         'CC_MAIN_2021_AND_FORWARD',
                         ?
                     )
-                """, [file_url])
+                """, [f"https://data.commoncrawl.org{file_url}"])
             except Exception as e:
-                print(f"  WARNING: Failed to add {file_url}: {e}")
+                print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
+                print("Trying through: https://ds5q9oxwqwsfj.cloudfront.net")
+                try:
+                    con.execute("""
+                        CALL ducklake_add_data_files(
+                            'commoncrawl',
+                            'CC_MAIN_2021_AND_FORWARD',
+                            ?,
+                            allow_missing => true
+                        )
+                    """, [f"https://ds5q9oxwqwsfj.cloudfront.net{file_url}"])
+                except Exception as e2:
+                    print(f"  WARNING: Also failed to add via CloudFront: {e2}")
 
     if shutdown_requested['flag']:
         print("\nShutdown requested. Closing connection and exiting...")
