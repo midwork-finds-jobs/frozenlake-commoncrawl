@@ -184,7 +184,7 @@ def main():
     parquet_files_2013_2021 = con.execute("""
         SELECT url
         FROM idempotent_parquet_files
-        INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
+        INNER JOIN crawl_info ON contains(lower(url), '/crawl=' || lower(crawl_info.id) || '/')
         WHERE id BETWEEN 'CC-MAIN-2013-20' AND 'CC-MAIN-2021-43'
         ORDER BY url
     """).fetchall()
@@ -241,7 +241,7 @@ def main():
     parquet_files_2021_forward = con.execute("""
         SELECT url
         FROM idempotent_parquet_files
-        INNER JOIN crawl_info ON contains(url, '/crawl=' || crawl_info.id || '/')
+        INNER JOIN crawl_info ON contains(lower(url), '/crawl=' || lower(crawl_info.id) || '/')
         WHERE id >= 'CC-MAIN-2021-49'
         ORDER BY url
     """).fetchall()
