@@ -217,10 +217,9 @@ def main():
                     break
                 except Exception as e:
                     if '403 (Forbidden)' in str(e):
-                        retry_delay = min(fib_a, 600)  # Cap at 10 minutes
+                        retry_delay = 255
                         print(f"  403 Forbidden for {file_url}, retrying in {retry_delay}s...")
                         time.sleep(retry_delay)
-                        fib_a, fib_b = fib_b, fib_a + fib_b
                     else:
                         print(f"  WARNING: Failed to add https://data.commoncrawl.org{file_url}: {e}")
                         break
