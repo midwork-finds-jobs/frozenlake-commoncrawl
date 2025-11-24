@@ -126,9 +126,7 @@ def main():
     # Ensure required columns exist (added in later crawls but missing in older schemas)
     print("Checking for required columns in CC_MAIN_2013_TO_2021...")
     existing_columns = con.execute("""
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema = 'commoncrawl' AND table_name = 'CC_MAIN_2013_TO_2021'
+        SELECT column_name FROM (DESCRIBE FROM commoncrawl.CC_MAIN_2013_TO_2021)
     """).fetchall()
     existing_columns = {row[0].lower() for row in existing_columns}
     print(f"  Existing columns: {sorted(existing_columns)}")
