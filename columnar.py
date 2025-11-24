@@ -164,6 +164,16 @@ def main():
     """).fetchone()[0]
     print(f"Total idempotentparquet files found: {parquet_file_count}")
 
+    # Print sample of idempotent files
+    sample_files = con.execute("""
+        SELECT url
+        FROM idempotent_parquet_files
+        LIMIT 5
+    """).fetchall()
+    print("Sample idempotent parquet files:")
+    for row in sample_files:
+        print(f"  {row[0]}")
+
     # ========================================
     # Table 1: CC-MAIN-2013-20 to CC-MAIN-2021-43
     # (years 2013-2023 without timezone in fetch_time)
