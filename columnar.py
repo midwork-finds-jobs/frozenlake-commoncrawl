@@ -80,11 +80,11 @@ def main():
         if not os.getenv('AWS_ACCESS_KEY_ID') or not os.getenv('AWS_SECRET_ACCESS_KEY'):
             print("AWS_ACCESS_KEY_ID or AWS_SECRET_ACCESS_KEY env is missing!")
             exit(1)
-        con.execute("""
+        con.execute(f"""
             CREATE SECRET IF NOT EXISTS commoncrawl_s3 (
                 TYPE S3,
-                KEY_ID getenv('AWS_ACCESS_KEY_ID'),
-                SECRET getenv('AWS_SECRET_ACCESS_KEY'),
+                KEY_ID {os.getenv('AWS_ACCESS_KEY_ID')},
+                SECRET {os.getenv('AWS_SECRET_ACCESS_KEY')},
                 REGION 'us-east-1'
             )
         """)
