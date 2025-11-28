@@ -35,7 +35,7 @@ run_migration_if_needed() {
                 ATTACH '${DB_PATH}' AS cc;
                 ALTER TABLE cc.${TABLE} ADD COLUMN content_charset VARCHAR;
                 ALTER TABLE cc.${TABLE} ADD COLUMN content_languages VARCHAR;
-            " 2>/dev/null || echo "  [Migration] Columns may already exist"
+            " || { echo "  [Migration] FAILED for ${crawl_id}"; exit 1; }
             ;;
         "CC-MAIN-2019-47")
             echo "  [Migration] Adding fetch_redirect and content_truncated columns..."
@@ -43,7 +43,7 @@ run_migration_if_needed() {
                 ATTACH '${DB_PATH}' AS cc;
                 ALTER TABLE cc.${TABLE} ADD COLUMN fetch_redirect VARCHAR;
                 ALTER TABLE cc.${TABLE} ADD COLUMN content_truncated VARCHAR;
-            " 2>/dev/null || echo "  [Migration] Columns may already exist"
+            " || { echo "  [Migration] FAILED for ${crawl_id}"; exit 1; }
             ;;
         "CC-MAIN-2021-49")
             echo "  [Migration] Altering fetch_time to TIMESTAMPTZ and adding url_host_name_reversed..."
@@ -51,7 +51,7 @@ run_migration_if_needed() {
                 ATTACH '${DB_PATH}' AS cc;
                 ALTER TABLE cc.${TABLE} ALTER COLUMN fetch_time TYPE TIMESTAMPTZ;
                 ALTER TABLE cc.${TABLE} ADD COLUMN url_host_name_reversed VARCHAR;
-            " 2>/dev/null || echo "  [Migration] Changes may already be applied"
+            " || { echo "  [Migration] FAILED for ${crawl_id}"; exit 1; }
             ;;
     esac
 }
