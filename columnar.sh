@@ -6,6 +6,10 @@
 
 set -euo pipefail
 
+# Graceful shutdown on Ctrl+C
+STOP_SIGNAL=false
+trap 'echo ""; echo "Stopping gracefully..."; STOP_SIGNAL=true' INT
+
 HTTP_BASE="https://data.commoncrawl.org"
 DB_PATH="ducklake:commoncrawl.ducklake"
 TABLE="warc"
@@ -66,7 +70,7 @@ $DUCKDB paths.duckdb -c "
 
     ALTER TABLE commoncrawl.${TABLE} SET PARTITIONED BY (crawl, subset);
 
-    CREATE VIEW files_to_process AS (
+    CREATE VIEW IF NOT EXISTS files_to_process AS (
         SELECT data_file
         FROM all_data_files
         EXCEPT
@@ -79,11 +83,13 @@ $DUCKDB paths.duckdb -c "
 CRAWLS=$($DUCKDB paths.duckdb -csv -noheader -c "SELECT DISTINCT id FROM crawl_info ORDER BY id")
 
 for CRAWL_ID in $CRAWLS; do
+    [[ "$STOP_SIGNAL" == "true" ]] && break
+
     echo ""
     echo "[${CRAWL_ID}] Checking files..."
 
     # Get pending files for this crawl
-    CRAWL_FILES=$($DUCKDB paths.duckdb -csv -noheader -c "FROM files_to_process WHERE contains(data_file,'crawl=${CRAWL_ID}')")
+    CRAWL_FILES=$($DUCKDB paths.duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS commoncrawl (DATA_PATH 'tmp_always_empty'); FROM files_to_process WHERE contains(data_file,'crawl=${CRAWL_ID}')")
     
     PENDING_COUNT=$(echo "$CRAWL_FILES" | wc -l)
     echo "found files: $PENDING_COUNT"
@@ -92,9 +98,6 @@ for CRAWL_ID in $CRAWLS; do
         echo "[${CRAWL_ID}] processed completely!"
         continue
     fi
-    
-    echo "Stopping early!"
-    exit 1
 
     # Run TIMESTAMPTZ migration if needed (CC-MAIN-2021-49)
     if [[ "$CRAWL_ID" == "CC-MAIN-2021-49" ]]; then
@@ -106,27 +109,32 @@ for CRAWL_ID in $CRAWLS; do
     fi
 
     for CRAWL_FILE in $CRAWL_FILES; do
+        [[ "$STOP_SIGNAL" == "true" ]] && break
+
         echo "  Adding data files from ${CRAWL_FILE}..."
 
         # Add data files to DuckLake with retry on 403
         while true; do
-            # TODO: Capture error output and check for 403 specifically
-            $DUCKDB -c "
+            [[ "$STOP_SIGNAL" == "true" ]] && break
+
+            ERROR_OUTPUT=$($DUCKDB -c "
                 SET http_retries = 1000;
                 SET http_retry_backoff = 6;
                 SET http_retry_wait_ms = 500;
 
                 ATTACH 'ducklake:commoncrawl.ducklake' AS cc;
-                CALL ducklake_add_data_files('cc', '${TABLE}', '${CRAWL_FILE}');
-            "
-            ERROR=$?
-            if [[ $ERROR == *"403"* ]]; then
-                echo "  [403 Forbidden] Retrying ${FILE_PATH} in 255s..."
+                CALL ducklake_add_data_files('cc', '${TABLE}', '${HTTP_BASE}${CRAWL_FILE}');
+            " 2>&1) && break  # Success, exit loop
+
+            # Check if error contains 403
+            if [[ "$ERROR_OUTPUT" == *"403"* ]]; then
+                echo "  [403 Forbidden] Retrying ${CRAWL_FILE} in 255s..."
                 sleep 255
             else
-                echo "  [Error] ${FILE_PATH} failed with error: ${ERROR}"
+                echo "  [Error] ${CRAWL_FILE}: ${ERROR_OUTPUT}"
                 break
             fi
+        done
     done
 
     echo "  Completed ${CRAWL_ID}"
