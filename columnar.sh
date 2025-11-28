@@ -13,7 +13,9 @@ trap 'echo ""; echo "Stopping gracefully..."; STOP_SIGNAL=true' INT
 HTTP_BASE="https://data.commoncrawl.org"
 DB_PATH="ducklake:commoncrawl.ducklake"
 TABLE="warc"
-DUCKDB="../ducklake/build/release/duckdb -unsigned --init /dev/null"
+# Override DUCKDB env var for custom builds (e.g. unreleased features like TIMESTAMPTZ migration)
+# Example: DUCKDB="../ducklake/build/release/duckdb -unsigned" ./columnar.sh
+DUCKDB="${DUCKDB:-duckdb} --init /dev/null"
 
 # Track which crawl we're currently processing (for first-file migrations)
 CURRENT_CRAWL=""
@@ -65,10 +67,6 @@ echo "Initializing DuckDB and generating file lists..."
 
 # Generate all crawl files list
 $DUCKDB paths.duckdb -c "
-    SET http_retries = 1000;
-    SET http_retry_backoff = 6;
-    SET http_retry_wait_ms = 500;
-
     CREATE TABLE IF NOT EXISTS crawl_info AS
         FROM read_json('${COLLINFO}')
         WHERE id NOT IN (
@@ -128,7 +126,7 @@ for CRAWL_ID in $CRAWLS; do
     echo "[${CRAWL_ID}] Checking files..."
 
     # Get pending files for this crawl
-    CRAWL_FILES=$($DUCKDB paths.duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS commoncrawl (DATA_PATH 'tmp_always_empty'); FROM files_to_process WHERE contains(data_file,'crawl=${CRAWL_ID}')")
+    CRAWL_FILES=$($DUCKDB paths.duckdb -csv -noheader -c "ATTACH '${DB_PATH}' AS commoncrawl (DATA_PATH 'tmp_always_empty'); FROM files_to_process WHERE contains(data_file,'crawl=${CRAWL_ID}') ORDER BY data_file ASC;")
     
     PENDING_COUNT=$(echo "$CRAWL_FILES" | wc -l)
     echo "found files: $PENDING_COUNT"
@@ -152,7 +150,7 @@ for CRAWL_ID in $CRAWLS; do
 
             ERROR_OUTPUT=$($DUCKDB -c "
                 SET http_retries = 1000;
-                SET http_retry_backoff = 6;
+                SET http_retry_backoff = 3;
                 SET http_retry_wait_ms = 500;
 
                 ATTACH '${DB_PATH}' AS cc;
