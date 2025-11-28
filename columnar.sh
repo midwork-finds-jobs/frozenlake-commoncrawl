@@ -48,6 +48,9 @@ run_migration_if_needed() {
         "CC-MAIN-2021-49")
             echo "  [Migration] Altering fetch_time to TIMESTAMPTZ and adding url_host_name_reversed..."
             $DUCKDB -c "
+                -- Keep the time in UTC for consistency
+                SET TimeZone = 'UTC';
+
                 ATTACH '${DB_PATH}' AS cc;
                 ALTER TABLE cc.${TABLE} ALTER COLUMN fetch_time TYPE TIMESTAMPTZ;
                 ALTER TABLE cc.${TABLE} ADD COLUMN url_host_name_reversed VARCHAR;
