@@ -14,8 +14,8 @@ HTTP_BASE="https://data.commoncrawl.org"
 DB_PATH="ducklake:commoncrawl.ducklake"
 TABLE="warc"
 # Override DUCKDB env var for custom builds (e.g. unreleased features like TIMESTAMPTZ migration)
-# Example: DUCKDB="../ducklake/build/release/duckdb -unsigned" ./columnar.sh
-DUCKDB="${DUCKDB:-duckdb} --init /dev/null"
+# Example: DUCKDB="../ducklake/build/release/duckdb -unsigned --init /dev/null" ./columnar.sh
+DUCKDB="${DUCKDB:-duckdb}"
 
 # Track which crawl we're currently processing (for first-file migrations)
 CURRENT_CRAWL=""
