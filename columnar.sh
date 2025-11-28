@@ -15,6 +15,45 @@ DB_PATH="ducklake:commoncrawl.ducklake"
 TABLE="warc"
 DUCKDB="../ducklake/build/release/duckdb -unsigned --init /dev/null"
 
+# Track which crawl we're currently processing (for first-file migrations)
+CURRENT_CRAWL=""
+
+# Run migrations if this is the first file for a crawl
+run_migration_if_needed() {
+    local crawl_id="$1"
+
+    # Skip if already processed this crawl
+    [[ "$crawl_id" == "$CURRENT_CRAWL" ]] && return 0
+    CURRENT_CRAWL="$crawl_id"
+
+    case "$crawl_id" in
+        "CC-MAIN-2018-39")
+            echo "  [Migration] Adding content_charset and content_languages columns..."
+            $DUCKDB -c "
+                ATTACH '${DB_PATH}' AS cc;
+                ALTER TABLE cc.${TABLE} ADD COLUMN content_charset VARCHAR;
+                ALTER TABLE cc.${TABLE} ADD COLUMN content_languages VARCHAR;
+            " 2>/dev/null || echo "  [Migration] Columns may already exist"
+            ;;
+        "CC-MAIN-2019-47")
+            echo "  [Migration] Adding fetch_redirect and content_truncated columns..."
+            $DUCKDB -c "
+                ATTACH '${DB_PATH}' AS cc;
+                ALTER TABLE cc.${TABLE} ADD COLUMN fetch_redirect VARCHAR;
+                ALTER TABLE cc.${TABLE} ADD COLUMN content_truncated VARCHAR;
+            " 2>/dev/null || echo "  [Migration] Columns may already exist"
+            ;;
+        "CC-MAIN-2021-49")
+            echo "  [Migration] Altering fetch_time to TIMESTAMPTZ and adding url_host_name_reversed..."
+            $DUCKDB -c "
+                ATTACH '${DB_PATH}' AS cc;
+                ALTER TABLE cc.${TABLE} ALTER COLUMN fetch_time TYPE TIMESTAMPTZ;
+                ALTER TABLE cc.${TABLE} ADD COLUMN url_host_name_reversed VARCHAR;
+            " 2>/dev/null || echo "  [Migration] Changes may already be applied"
+            ;;
+    esac
+}
+
 # Use local collinfo.json if exists
 if [[ -f "./collinfo.json" ]]; then
     COLLINFO="./collinfo.json"
@@ -99,14 +138,8 @@ for CRAWL_ID in $CRAWLS; do
         continue
     fi
 
-    # Run TIMESTAMPTZ migration if needed (CC-MAIN-2021-49)
-    if [[ "$CRAWL_ID" == "CC-MAIN-2021-49" ]]; then
-        echo "  Running TIMESTAMPTZ migration..."
-        $DUCKDB -c "
-            ATTACH 'ducklake:commoncrawl.ducklake' AS cc;
-            ALTER TABLE cc.${TABLE} ALTER COLUMN fetch_time TYPE TIMESTAMPTZ;
-        "
-    fi
+    # Run migrations if this is first file for this crawl
+    run_migration_if_needed "$CRAWL_ID"
 
     for CRAWL_FILE in $CRAWL_FILES; do
         [[ "$STOP_SIGNAL" == "true" ]] && break
@@ -122,7 +155,7 @@ for CRAWL_ID in $CRAWLS; do
                 SET http_retry_backoff = 6;
                 SET http_retry_wait_ms = 500;
 
-                ATTACH 'ducklake:commoncrawl.ducklake' AS cc;
+                ATTACH '${DB_PATH}' AS cc;
                 CALL ducklake_add_data_files('cc', '${TABLE}', '${HTTP_BASE}${CRAWL_FILE}');
             " 2>&1) && break  # Success, exit loop
 
