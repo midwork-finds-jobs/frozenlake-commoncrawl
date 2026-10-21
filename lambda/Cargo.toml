@@ -1,0 +1,28 @@
+[package]
+name = "commoncrawl-query"
+version = "0.1.0"
+edition = "2024"
+description = "Runs read-only SQL against the frozen Common Crawl DuckLake and streams zstd compressed Arrow IPC"
+license = "MIT"
+
+[[bin]]
+name = "bootstrap"
+path = "src/main.rs"
+
+[dependencies]
+# Links against the official DuckDB 2.0 shared library, see build.sh
+duckdb = { git = "https://github.com/duckdb/duckdb-rs", rev = "e1b0940dfddd575c43fe4e2f070d47ee53d419cd", default-features = false }
+arrow-ipc = { version = "60", features = ["zstd"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+axum = { version = "0.8", default-features = false, features = ["query", "tokio"] }
+bytes = "1"
+lambda_http = { version = "1", default-features = false, features = ["apigw_http", "tracing"] }
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs", "io-util", "sync"] }
+sha2 = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
