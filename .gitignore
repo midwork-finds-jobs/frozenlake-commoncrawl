@@ -12,3 +12,10 @@ devenv.local.yaml
 # Don't include the testing ducklake
 commoncrawl.ducklake
 commoncrawl.ducklake.wal
+commoncrawl_s3.ducklake
+commoncrawl_s3.ducklake.wal
+commoncrawl_s3.frozen.ducklake
+commoncrawl.frozen.ducklake
+
+# Python
+__pycache__/
