@@ -8,14 +8,19 @@
 set -euo pipefail
 
 cd "$(dirname "$0")"
-DUCKDB_LIB="target/duckdb-out"
+# Another DuckDB build can be used with DUCKDB_LIB, for example one built with DUCKDB_PATCH
+DUCKDB_LIB="${DUCKDB_LIB:-target/duckdb-out}"
 PACKAGE="target/package"
+
+# DuckDB v2.0.0 with the parquet page index pull request https://github.com/duckdb/duckdb/pull/27326
+# applied. Common Crawl files have a page index so this reads 9-23x less data for url_surtkey lookups.
+DUCKDB_PATCH="${DUCKDB_PATCH-patches/duckdb-pr-27326.diff}"
 
 # Building DuckDB takes a while so it's only done once. Remove target/duckdb-out to rebuild.
 if [[ ! -f "${DUCKDB_LIB}/libduckdb.so" ]]; then
     echo "Building minimal DuckDB in an Amazon Linux 2023 container..."
     mkdir -p target/duckdb-build "$DUCKDB_LIB"
-    container run --rm --arch arm64 --cpus "$(sysctl -n hw.ncpu)" --memory 16g \
+    container run --rm --arch arm64 --cpus "$(sysctl -n hw.ncpu)" --memory 16g -e DUCKDB_PATCH="$DUCKDB_PATCH" -e JEMALLOC="${JEMALLOC:-0}" \
         -v "$(pwd)/duckdb:/src" -v "$(pwd)/target/duckdb-build:/build" -v "$(pwd)/${DUCKDB_LIB}:/out" \
         public.ecr.aws/amazonlinux/amazonlinux:2023 bash /src/build.sh
 fi

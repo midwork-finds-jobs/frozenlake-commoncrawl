@@ -1,5 +1,6 @@
 # Extensions statically linked into the minimal libduckdb.so of the lambda.
 # parquet reads Common Crawl, httpfs reads S3 and ducklake reads the frozen catalog.
+# jemalloc isn't an extension anymore, it's enabled with JEMALLOC=1 in build.sh.
 # Versions are the same as in duckdb/.github/config/extensions/*.cmake of DuckDB v2.0.0.
 
 duckdb_extension_load(core_functions)

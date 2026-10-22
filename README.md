@@ -134,7 +134,7 @@ laptop (DuckDB) ──https──> CloudFront ──> Lambda (DuckDB + DuckLake)
 ```
 
 - **CloudFront** checks the [signed cookies](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/private-content-signed-cookies.html) and is used because of the AWS free tier: CloudFront includes 1TB of data transfer out per month while all other services share 100GB per month. Transfer from Lambda to CloudFront is free.
-- **Lambda** runs a minimal DuckDB build with only `parquet`, `httpfs` and `ducklake` statically linked ([lambda/duckdb/extension_config.cmake](lambda/duckdb/extension_config.cmake)) which keeps the package small and cold starts fast.
+- **Lambda** runs a minimal DuckDB build with only `parquet`, `httpfs` and `ducklake` statically linked ([lambda/duckdb/extension_config.cmake](lambda/duckdb/extension_config.cmake)) which keeps the package small and cold starts fast. It includes the unreleased [parquet page index](#parquet-page-index) support from [duckdb/duckdb#27326](https://github.com/duckdb/duckdb/pull/27326).
 
 ### Deploy
 
@@ -283,7 +283,7 @@ table = pyarrow.ipc.open_stream(response.raw).read_all()
 
 ### Performance and free tier
 
-Measured from Finland with `infra/benchmark.sh` in October 2026. `seconds` is the time to load the result into a local DuckDB table, `GB-s` is the billed lambda duration multiplied by memory. The free tier includes 400 000 GB-s and 1 million requests per month.
+Measured from Finland with `infra/benchmark.sh` in October 2026 with DuckDB v2.0.0 before the [page index](#parquet-page-index) patch. `seconds` is the time to load the result into a local DuckDB table, `GB-s` is the billed lambda duration multiplied by memory. The free tier includes 400 000 GB-s and 1 million requests per month.
 
 Small result: the 117 988 distinct `.fi` domains of one crawl (1MB of Arrow, returned directly):
 
@@ -312,6 +312,38 @@ Large result: url, fetch time and status of all 7.6M `.fi` pages of one crawl (1
 - Cold start takes ~3.5s: downloading the 65MB catalog from S3 takes ~3s and opening DuckDB ~0.35s.
 - Most of the large query time is the download from CloudFront to Finland, not the lambda.
 - Lambda responses over 6MB are streamed at only 2MB/s. Before results were uploaded into S3 the large query took ~48s and ~140 GB-s.
+
+### Parquet page index
+
+Common Crawl writes the files with Spark (`parquet-mr`), which stores a [page index](https://parquet.apache.org/docs/file-format/pageindex/) (`ColumnIndex` and `OffsetIndex`) for every column but no bloom filters. Every file has ~7.2M rows in only 5 row groups. DuckDB v2.0.0 can only skip whole row groups, so even a lookup of a single domain downloads ~1.45M rows of every selected column.
+
+The rows are sorted by `url_surtkey`, so its page index tells exactly which ~1MB pages contain a domain. The lambda is built from DuckDB v2.0.0 with [duckdb/duckdb#27326](https://github.com/duckdb/duckdb/pull/27326) applied ([lambda/duckdb/patches](lambda/duckdb/patches)), which uses the page index to skip the other pages. The query results are identical. Measured in October 2026 ([results in the pull request](https://github.com/duckdb/duckdb/pull/27326#issuecomment-6327388097)):
+
+| Query | MB downloaded v2.0.0 | MB downloaded with page index | Lambda billed v2.0.0 | Lambda billed with page index |
+|---|---:|---:|---:|---:|
+| `url` of one domain in one crawl | 26.41 | 2.79 | 529 ms | 362 ms |
+| `*` of one domain in one crawl | 90.24 | 10.55 | 1040 ms | 619 ms |
+| `url` with an url prefix | 26.41 | 1.15 | 544 ms | 354 ms |
+| `crawl, url` of one domain in 10 crawls | 455.09 | 37.69 | 6054 ms | 1445 ms |
+| 3 columns of the whole `.fi` TLD | 147.16 | 126.95 | | |
+
+The page index only helps when filtering with `url_surtkey`, which is what the [`url_surtkey` macros](#query-by-domain-or-url-with-url_surtkey) do. The patch is applied by default. Build the official DuckDB v2.0.0 instead with:
+
+```bash
+rm -rf lambda/target/duckdb-out
+DUCKDB_PATCH= lambda/build.sh
+```
+
+Remove the patch once the pull request is in a DuckDB release.
+
+### jemalloc
+
+DuckDB uses [jemalloc](https://jemalloc.net/) as the allocator on Linux by default, but it's disabled in the lambda build because it was slower there. Loading the 7.6M `.fi` pages of one crawl billed ~5.0s with jemalloc and ~4.2s without it at 3008MB (3 runs each, measured twice). The `url_surtkey` lookups were equally fast with both. Build with jemalloc to compare:
+
+```bash
+rm -rf lambda/target/duckdb-out
+JEMALLOC=1 lambda/build.sh
+```
 
 ### Security
 
