@@ -22,6 +22,7 @@
 #include "miniz_wrapper.hpp"
 
 #include <libdeflate.h>
+#include <zlib.h>
 
 #include <atomic>
 #include <chrono>
@@ -106,6 +107,8 @@ struct FetchedRecord {
 	vector<pair<string, string>> http_headers;
 	string body;
 	string error;
+	//! The body was cut by warc_fetch(until := ..., max_bytes := ...)
+	bool truncated = false;
 };
 
 //! Threads shared by every warc_record() call so that parallel DuckDB tasks don't multiply the thread count
@@ -461,75 +464,6 @@ OpenFileInfo RecordFileInfo(const string &path) {
 	return info;
 }
 
-void FetchRecord(const shared_ptr<ClientContext> &context, FileSystem &fs, const string &path, int64_t offset,
-                 int64_t length, const string &charset_hint, bool skip_head, idx_t hedge_ms, FetchedRecord &record) {
-	if (offset < 0 || length <= 0 || offset > NumericLimits<int64_t>::Maximum() - length) {
-		record.error = "invalid offset or length";
-		return;
-	}
-	if (NumericCast<idx_t>(length) > MAX_COMPRESSED_BYTES) {
-		record.error = StringUtil::Format("record is larger than %llu bytes", MAX_COMPRESSED_BYTES);
-		return;
-	}
-	// The record is inflated and parsed after fetching, which takes several times the compressed size
-	MemoryReservation reservation(NumericCast<idx_t>(length) * 8);
-	// The read runs on the read pool so that a slow request can be hedged: S3 answers a few percent of the
-	// requests only after several seconds, and the slowest request decides when a whole vector of records is done.
-	auto started = std::chrono::steady_clock::now();
-	auto read = make_shared_ptr<RangeRead>();
-	read->running = 1;
-	auto &reads = FetchPool::Reads();
-	auto submit = [&]() {
-		if (reads.ThreadCount() == 0) {
-			// No threads could be started, the read runs here and can't be hedged
-			ReadRange(fs, path, offset, length, skip_head, read);
-			return;
-		}
-		try {
-			// The read which loses a hedge keeps running after the query, the file system belongs to the client
-			// context so the read keeps the context alive
-			reads.Submit([context, &fs, path, offset, length, skip_head, read]() {
-				ReadRange(fs, path, offset, length, skip_head, read);
-			});
-		} catch (...) {
-			// Without a pool thread the read runs here, the waiting below then returns at once
-			ReadRange(fs, path, offset, length, skip_head, read);
-		}
-	};
-	submit();
-	string compressed;
-	{
-		std::unique_lock<std::mutex> guard(read->lock);
-		auto is_done = [&]() {
-			return read->done;
-		};
-		if (hedge_ms > 0 && !read->finished.wait_for(guard, std::chrono::milliseconds(hedge_ms), is_done)) {
-			read->running++;
-			fetch_hedges++;
-			guard.unlock();
-			submit();
-			guard.lock();
-		}
-		read->finished.wait(guard, is_done);
-		if (!read->error.empty()) {
-			fetch_errors++;
-			record.error = read->error;
-			return;
-		}
-		compressed = std::move(read->data);
-	}
-	auto elapsed = idx_t(
-	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count());
-	fetch_count++;
-	if (elapsed >= 1000) {
-		slow_fetches++;
-	}
-	for (auto max = max_fetch_ms.load(); elapsed > max && !max_fetch_ms.compare_exchange_weak(max, elapsed);) {
-	}
-	ParseWarc(InflateGzipMember(compressed.data(), compressed.size(), MAX_RECORD_BYTES), charset_hint, record);
-	record.fetched = true;
-}
-
 Value HeadersToMap(const vector<pair<string, string>> &headers) {
 	// MAP keys must be unique so repeated headers are joined like HTTP does
 	vector<string> order;
@@ -559,8 +493,12 @@ struct FetchJob {
 	string charset_hint;
 };
 
-constexpr idx_t MAX_FETCH_THREADS = 256;
-constexpr idx_t MAX_READ_THREADS = 512;
+//! Lambda allows 1024 open files, every request in flight holds a connection
+constexpr idx_t MAX_ASYNC_REQUESTS = 768;
+//! Threads for reading local files, remote ones are read by the async fetcher
+constexpr idx_t LOCAL_READ_THREADS = 32;
+//! Threads which parse streamed records
+constexpr idx_t STREAM_THREADS = 8;
 
 struct FetchSettings {
 	explicit FetchSettings(ClientContext &context)
@@ -569,15 +507,25 @@ struct FetchSettings {
 	      concurrency(MaxValue<idx_t>(1, GetSetting<idx_t>(context, "warc_concurrency", 32))),
 	      skip_head(GetSetting<bool>(context, "warc_skip_head", true)),
 	      hedge_ms(GetSetting<idx_t>(context, "warc_hedge_ms", 1000)) {
-		// Every fetch has a read and possibly a hedged read running, slow reads keep running after losing. Lambda
-		// allows about 1024 threads per process, so both pools together stay well below it.
-		concurrency = MinValue<idx_t>(concurrency, MAX_FETCH_THREADS);
-		FetchPool::Get().EnsureThreads(concurrency);
-		FetchPool::Reads().EnsureThreads(MinValue<idx_t>(concurrency * 2 + 32, MAX_READ_THREADS));
+		concurrency = MinValue<idx_t>(concurrency, MAX_ASYNC_REQUESTS);
+		SetAsyncConcurrency(concurrency);
 	}
 
-	//! Keeps the file system alive for reads which outlive the query, see FetchRecord()
+	//! Credentials of the S3 secret for a bucket, looked up once
+	optional_ptr<const S3Credentials> Credentials(const string &path) {
+		auto bucket = path.substr(0, path.find('/', 5));
+		auto entry = credentials.find(bucket);
+		if (entry == credentials.end()) {
+			S3Credentials found;
+			bool has = S3Credentials::Lookup(*context, path, found);
+			entry = credentials.emplace(bucket, std::make_pair(has, found)).first;
+		}
+		return entry->second.first ? &entry->second.second : nullptr;
+	}
+
+	//! Keeps the file system alive for reads which outlive the query
 	shared_ptr<ClientContext> context;
+	unordered_map<string, std::pair<bool, S3Credentials>> credentials;
 	FileSystem &fs;
 	string base_path;
 	idx_t concurrency;
@@ -609,17 +557,291 @@ bool MakeJob(const FetchSettings &settings, UnifiedVectorFormat &files, UnifiedV
 	return true;
 }
 
-//! Fetches one record, never throws: errors are in the record
-void RunJob(const FetchSettings &settings, const FetchJob &job, FetchedRecord &record) {
+//! First match selectors of the query which reads the records, see SetWarcFetchStreamSelectors()
+using StreamSelectors = shared_ptr<const vector<string>>;
+
+//! Inflates a gzip member as it arrives and parses its HTML body incrementally until every selector the query needs
+//! has its final first match, so the rest of the record isn't downloaded or inflated at all
+class StreamingRecord {
+public:
+	explicit StreamingRecord(StreamSelectors selectors_p) : selectors(std::move(selectors_p)) {
+		memset(&stream, 0, sizeof(stream));
+		initialized = inflateInit2(&stream, 16 + MAX_WBITS) == Z_OK;
+		failed = !initialized;
+	}
+	~StreamingRecord() {
+		if (initialized) {
+			inflateEnd(&stream);
+		}
+	}
+
+	//! false once the record has what the query needs, or when the data isn't a gzip member
+	bool Feed(const char *data, idx_t size) {
+		if (failed || finished) {
+			return !failed;
+		}
+		stream.next_in = reinterpret_cast<Bytef *>(const_cast<char *>(data));
+		stream.avail_in = uInt(size);
+		char buffer[65536];
+		while (stream.avail_in > 0) {
+			stream.next_out = reinterpret_cast<Bytef *>(buffer);
+			stream.avail_out = sizeof(buffer);
+			auto status = inflate(&stream, Z_NO_FLUSH);
+			out.append(buffer, sizeof(buffer) - stream.avail_out);
+			if (status == Z_STREAM_END) {
+				finished = true;
+				break;
+			}
+			if ((status != Z_OK && status != Z_BUF_ERROR) || out.size() > MAX_RECORD_BYTES) {
+				failed = true;
+				return false;
+			}
+			if (stream.avail_out == sizeof(buffer)) {
+				break;
+			}
+		}
+		try {
+			return finished || !Found();
+		} catch (std::exception &) {
+			// The page can't be parsed incrementally, read all of it
+			matcher.reset();
+			gave_up = true;
+			return true;
+		}
+	}
+
+	string out;
+	bool failed = false;
+	bool finished = false;
+
+private:
+	z_stream stream;
+	bool initialized = false;
+	StreamSelectors selectors;
+	unique_ptr<HtmlStreamMatcher> matcher;
+	idx_t body_start = string::npos;
+	idx_t parsed = 0;
+	//! A body with Content-Encoding or selectors which can't be streamed: the record is read completely
+	bool gave_up = false;
+
+	bool FindBody() {
+		auto warc_end = out.find("\r\n\r\n");
+		if (warc_end == string::npos) {
+			return false;
+		}
+		auto position = warc_end + 4;
+		if (out.compare(position, 5, "HTTP/") == 0) {
+			auto http_end = out.find("\r\n\r\n", position);
+			if (http_end == string::npos) {
+				return false;
+			}
+			auto headers = StringUtil::Lower(out.substr(position, http_end - position));
+			auto encoding = headers.find("\ncontent-encoding:");
+			if (encoding != string::npos) {
+				auto line_end = headers.find('\r', encoding + 1);
+				auto value = Trim(headers.substr(encoding + 18, line_end == string::npos ? string::npos
+				                                                                           : line_end - encoding - 18));
+				gave_up = value != "identity";
+			}
+			position = http_end + 4;
+		}
+		body_start = position;
+		parsed = position;
+		if (!gave_up) {
+			matcher = HtmlStreamMatcher::Create(*selectors);
+			gave_up = !matcher;
+		}
+		return true;
+	}
+
+	bool Found() {
+		if (body_start == string::npos && !FindBody()) {
+			return false;
+		}
+		if (gave_up || parsed >= out.size()) {
+			return false;
+		}
+		auto found = matcher->Feed(out.data() + parsed, out.size() - parsed);
+		parsed = out.size();
+		return found;
+	}
+};
+
+//! The result of one fetch, filled by the async fetcher
+struct FetchSlot {
+	bool done = false;
+	//! data is the inflated record instead of the gzip member
+	bool decompressed = false;
+	bool truncated = false;
+	string data;
+	string error;
+};
+
+struct FetchWaiter {
+	std::mutex lock;
+	std::condition_variable finished;
+};
+
+bool IsRemote(const string &path) {
+	return StringUtil::StartsWith(path, "s3://") || StringUtil::StartsWith(path, "https://") ||
+	       StringUtil::StartsWith(path, "http://");
+}
+
+//! Starts fetching a record. The slot is filled and the waiter notified when it's done, never throws.
+//! Parses a streamed record on the fetch pool so that the fetcher thread only moves bytes. Chunks are queued and one
+//! pool task at a time works through them, setting stop once the record has what the query needs.
+struct StreamTask {
+	explicit StreamTask(StreamSelectors selectors) : record(std::move(selectors)) {
+	}
+	std::mutex lock;
+	std::deque<string> chunks;
+	bool scheduled = false;
+	bool ended = false;
+	bool finalized = false;
+	string error;
+	std::atomic<bool> stop {false};
+	StreamingRecord record;
+	std::function<void(StreamTask &)> finalize;
+
+	//! Runs finalize once both the transfer and the parsing are done
+	void FinalizeIfDone(std::unique_lock<std::mutex> &guard) {
+		if (ended && !scheduled && !finalized) {
+			finalized = true;
+			guard.unlock();
+			finalize(*this);
+		}
+	}
+
+	static void Process(const shared_ptr<StreamTask> &task) {
+		while (true) {
+			string chunk;
+			{
+				std::unique_lock<std::mutex> guard(task->lock);
+				if (task->chunks.empty()) {
+					task->scheduled = false;
+					task->FinalizeIfDone(guard);
+					return;
+				}
+				chunk = std::move(task->chunks.front());
+				task->chunks.pop_front();
+			}
+			if (!task->stop && !task->record.Feed(chunk.data(), chunk.size())) {
+				task->stop = true;
+			}
+		}
+	}
+};
+
+void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelectors &stream_selectors,
+                const shared_ptr<FetchWaiter> &waiter, const shared_ptr<FetchSlot> &slot) {
+	auto finish = [waiter, slot](string data, string error, bool decompressed, bool truncated) {
+		{
+			std::lock_guard<std::mutex> guard(waiter->lock);
+			slot->data = std::move(data);
+			slot->error = std::move(error);
+			slot->decompressed = decompressed;
+			slot->truncated = truncated;
+			slot->done = true;
+		}
+		waiter->finished.notify_all();
+	};
 	try {
-		FetchRecord(settings.context, settings.fs, job.path, job.offset, job.length, job.charset_hint, settings.skip_head,
-		            settings.hedge_ms, record);
+		if (job.offset < 0 || job.length <= 0 || job.offset > NumericLimits<int64_t>::Maximum() - job.length) {
+			finish(string(), "invalid offset or length", false, false);
+			return;
+		}
+		if (NumericCast<idx_t>(job.length) > MAX_COMPRESSED_BYTES) {
+			finish(string(), StringUtil::Format("record is larger than %llu bytes", MAX_COMPRESSED_BYTES), false,
+			       false);
+			return;
+		}
+		if (!IsRemote(job.path)) {
+			// Local files are read with DuckDB's file system on the fetch pool
+			auto &pool = FetchPool::Get();
+			pool.EnsureThreads(LOCAL_READ_THREADS);
+			auto context = settings.context;
+			auto &fs = settings.fs;
+			auto skip_head = settings.skip_head;
+			pool.Submit([context, &fs, job, skip_head, finish]() {
+				auto read = make_shared_ptr<RangeRead>();
+				read->running = 1;
+				ReadRange(fs, job.path, job.offset, job.length, skip_head, read);
+				finish(std::move(read->data), std::move(read->error), false, false);
+			});
+			return;
+		}
+		// The async fetcher doesn't go through DuckDB's file system, so check allowed_directories here
+		if (!DBConfig::GetConfig(*settings.context).CanAccessFile(job.path, FileType::FILE_TYPE_REGULAR)) {
+			finish(string(), "Permission Error: cannot access " + job.path, false, false);
+			return;
+		}
+		optional_ptr<const S3Credentials> credentials;
+		if (StringUtil::StartsWith(job.path, "s3://")) {
+			credentials = settings.Credentials(job.path);
+		}
+		auto request = MakeRangeRequest(job.path, job.offset, job.length, credentials);
+		request.hedge_ms = settings.hedge_ms;
+		if (stream_selectors) {
+			FetchPool::Get().EnsureThreads(STREAM_THREADS);
+			auto task = make_shared_ptr<StreamTask>(stream_selectors);
+			task->finalize = [finish](StreamTask &task) {
+				if (task.record.failed) {
+					finish(string(), "invalid gzip data", false, false);
+				} else if (!task.error.empty() && !task.stop) {
+					finish(string(), task.error, false, false);
+				} else {
+					finish(std::move(task.record.out), string(), true, bool(task.stop) && !task.record.finished);
+				}
+			};
+			request.on_data = [task](const char *data, idx_t size) {
+				if (task->stop) {
+					return false;
+				}
+				bool schedule = false;
+				{
+					std::lock_guard<std::mutex> guard(task->lock);
+					task->chunks.emplace_back(data, size);
+					schedule = !task->scheduled;
+					task->scheduled = true;
+				}
+				if (schedule) {
+					FetchPool::Get().Submit([task]() { StreamTask::Process(task); });
+				}
+				return true;
+			};
+			request.on_done = [task](string, string error, bool) {
+				std::unique_lock<std::mutex> guard(task->lock);
+				task->ended = true;
+				task->error = std::move(error);
+				task->FinalizeIfDone(guard);
+			};
+		} else {
+			request.on_done = [finish](string data, string error, bool) {
+				finish(std::move(data), std::move(error), false, false);
+			};
+		}
+		SubmitAsyncRequest(std::move(request));
+	} catch (std::exception &ex) {
+		finish(string(), ErrorData(ex).RawMessage(), false, false);
+	}
+}
+
+//! Inflates and parses a fetched record, errors are in the record
+void DecodeSlot(const FetchJob &job, FetchSlot &slot, FetchedRecord &record) {
+	if (!slot.error.empty()) {
+		record.error = std::move(slot.error);
+		return;
+	}
+	try {
+		auto raw = slot.decompressed ? std::move(slot.data)
+		                             : InflateGzipMember(slot.data.data(), slot.data.size(), MAX_RECORD_BYTES);
+		string().swap(slot.data);
+		ParseWarc(raw, job.charset_hint, record);
+		record.truncated = slot.truncated;
+		record.fetched = true;
 	} catch (std::exception &ex) {
 		record.fetched = false;
 		record.error = ErrorData(ex).RawMessage();
-	} catch (...) {
-		record.fetched = false;
-		record.error = "unknown error";
 	}
 }
 
@@ -643,10 +865,12 @@ void WriteRecord(Vector &result, idx_t i, FetchedRecord *record) {
 		FlatVector::GetDataMutable<string_t>(children[3])[i] = StringVector::AddString(children[3], record->charset);
 		children[4].SetValue(i, HeadersToMap(record->warc_headers));
 		FlatVector::SetNull(children[5], i, true);
+		FlatVector::GetDataMutable<bool>(children[6])[i] = record->truncated;
 	} else {
 		for (idx_t c = 0; c < 5; c++) {
 			FlatVector::SetNull(children[c], i, true);
 		}
+		FlatVector::SetNull(children[6], i, true);
 		FlatVector::GetDataMutable<string_t>(children[5])[i] =
 		    StringVector::AddString(children[5], MakeValidUtf8(record->error));
 	}
@@ -670,16 +894,33 @@ void FetchIntoStruct(ClientContext &context, UnifiedVectorFormat &files, Unified
 	}
 	// Fetched records are about 8 times their compressed size until they are in the result vector
 	FetchBudget budget(compressed_bytes * 8);
-	vector<FetchedRecord> records(count);
-	vector<std::function<void()>> tasks;
+	auto waiter = make_shared_ptr<FetchWaiter>();
+	vector<shared_ptr<FetchSlot>> slots(count);
 	for (auto &job : jobs) {
-		tasks.push_back([&settings, &job, &records]() { RunJob(settings, job, records[job.row]); });
+		slots[job.row] = make_shared_ptr<FetchSlot>();
+		StartFetch(settings, job, nullptr, waiter, slots[job.row]);
 	}
-	RunParallel(settings.concurrency, tasks);
-
+	{
+		std::unique_lock<std::mutex> guard(waiter->lock);
+		waiter->finished.wait(guard, [&]() {
+			for (auto &job : jobs) {
+				if (!slots[job.row]->done) {
+					return false;
+				}
+			}
+			return true;
+		});
+	}
 	result.SetVectorType(VectorType::FLAT_VECTOR);
+	idx_t next_job = 0;
 	for (idx_t i = 0; i < count; i++) {
-		WriteRecord(result, i, valid[i] ? &records[i] : nullptr);
+		if (!valid[i]) {
+			WriteRecord(result, i, nullptr);
+			continue;
+		}
+		FetchedRecord record;
+		DecodeSlot(jobs[next_job++], *slots[i], record);
+		WriteRecord(result, i, &record);
 	}
 }
 
@@ -717,14 +958,13 @@ constexpr idx_t WARC_FETCH_WINDOW_BYTES = 32 * 1024 * 1024;
 struct WarcFetchBindData : public TableFunctionData {
 	idx_t file_column = 0, offset_column = 0, length_column = 0;
 	optional_idx charset_column;
+	//! Set by the optimizer when the query only needs the first matches of these selectors from the body
+	StreamSelectors stream_selectors;
 };
 
 //! Records of one input chunk which the fetch pool fills while the in-out function waits for them in order
-struct WarcFetchWindow {
-	std::mutex lock;
-	std::condition_variable finished;
-	vector<FetchedRecord> records;
-	vector<bool> done;
+struct WarcFetchWindow : public FetchWaiter {
+	vector<shared_ptr<FetchSlot>> slots;
 };
 
 struct WarcFetchLocalState : public LocalTableFunctionState {
@@ -745,7 +985,8 @@ LogicalType WarcRecordType() {
 	auto headers = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	child_list_t<LogicalType> children = {{"status", LogicalType::INTEGER},   {"headers", headers},
 	                                      {"body", LogicalType::VARCHAR},     {"charset", LogicalType::VARCHAR},
-	                                      {"warc", headers},                  {"error", LogicalType::VARCHAR}};
+	                                      {"warc", headers},                  {"error", LogicalType::VARCHAR},
+	                                      {"truncated", LogicalType::BOOLEAN}};
 	return LogicalType::STRUCT(children);
 }
 
@@ -789,35 +1030,19 @@ unique_ptr<LocalTableFunctionState> WarcFetchInitLocal(ExecutionContext &context
 }
 
 //! Submits rows to the fetch pool until the window is full
-void FillWindow(WarcFetchLocalState &state) {
-	auto &pool = FetchPool::Get();
+void FillWindow(WarcFetchLocalState &state, const StreamSelectors &stream_selectors) {
 	while (state.next_submit < state.jobs.size() &&
 	       (state.window_bytes < WARC_FETCH_WINDOW_BYTES || state.next_submit == state.next_emit)) {
 		auto row = state.next_submit++;
+		auto &slot = state.window->slots[row];
+		slot = make_shared_ptr<FetchSlot>();
 		if (!state.valid[row]) {
 			std::lock_guard<std::mutex> guard(state.window->lock);
-			state.window->done[row] = true;
+			slot->done = true;
 			continue;
 		}
 		state.window_bytes += NumericCast<idx_t>(MaxValue<int64_t>(state.jobs[row].length, 0));
-		auto window = state.window;
-		auto settings = state.settings;
-		auto job = state.jobs[row];
-		auto task = [window, settings, job, row]() {
-			FetchedRecord record;
-			RunJob(*settings, job, record);
-			{
-				std::lock_guard<std::mutex> guard(window->lock);
-				window->records[row] = std::move(record);
-				window->done[row] = true;
-			}
-			window->finished.notify_all();
-		};
-		try {
-			pool.Submit(task);
-		} catch (...) {
-			task();
-		}
+		StartFetch(*state.settings, state.jobs[row], stream_selectors, state.window, slot);
 	}
 }
 
@@ -847,11 +1072,10 @@ OperatorResultType WarcFetchFunction(ExecutionContext &context, TableFunctionInp
 			                         data.charset_column.IsValid() ? &charsets : nullptr, i, i, state.jobs[i]);
 		}
 		state.window = make_shared_ptr<WarcFetchWindow>();
-		state.window->records.resize(count);
-		state.window->done.assign(count, false);
+		state.window->slots.resize(count);
 		state.next_submit = state.next_emit = state.window_bytes = 0;
 	}
-	FillWindow(state);
+	FillWindow(state, data.stream_selectors);
 
 	// The next rows up to WARC_FETCH_CHUNK_BYTES, at least one, all of them submitted
 	auto start = state.next_emit;
@@ -869,7 +1093,7 @@ OperatorResultType WarcFetchFunction(ExecutionContext &context, TableFunctionInp
 		std::unique_lock<std::mutex> guard(window.lock);
 		window.finished.wait(guard, [&]() {
 			for (idx_t i = start; i < end; i++) {
-				if (!window.done[i]) {
+				if (!window.slots[i]->done) {
 					return false;
 				}
 			}
@@ -878,9 +1102,16 @@ OperatorResultType WarcFetchFunction(ExecutionContext &context, TableFunctionInp
 	}
 	auto &record = output.data[output.ColumnCount() - 1];
 	record.SetVectorType(VectorType::FLAT_VECTOR);
+	// Inflating and parsing runs on this DuckDB thread, so it's parallel over the threads of the query
 	for (idx_t i = 0; i < rows; i++) {
-		WriteRecord(record, i, state.valid[start + i] ? &window.records[start + i] : nullptr);
-		window.records[start + i] = FetchedRecord();
+		if (!state.valid[start + i]) {
+			WriteRecord(record, i, nullptr);
+		} else {
+			FetchedRecord fetched;
+			DecodeSlot(state.jobs[start + i], *window.slots[start + i], fetched);
+			WriteRecord(record, i, &fetched);
+		}
+		window.slots[start + i].reset();
 	}
 	SelectionVector selection(rows);
 	for (idx_t i = 0; i < rows; i++) {
@@ -892,8 +1123,8 @@ OperatorResultType WarcFetchFunction(ExecutionContext &context, TableFunctionInp
 	output.SetCardinality(rows);
 	state.next_emit = end;
 	state.window_bytes -= MinValue(bytes, state.window_bytes);
-	// Keep the pool busy while DuckDB processes this chunk
-	FillWindow(state);
+	// Keep the fetcher busy while DuckDB processes this chunk
+	FillWindow(state, data.stream_selectors);
 
 	if (state.next_emit < count) {
 		return OperatorResultType::HAVE_MORE_OUTPUT;
@@ -902,12 +1133,13 @@ OperatorResultType WarcFetchFunction(ExecutionContext &context, TableFunctionInp
 	return OperatorResultType::NEED_MORE_INPUT;
 }
 void WarcFetchStatsFunction(DataChunk &args, ExpressionState &state, Vector &result) {
-	child_list_t<Value> values = {{"fetches", Value::UBIGINT(fetch_count)},
-	                              {"retries", Value::UBIGINT(fetch_retries)},
-	                              {"errors", Value::UBIGINT(fetch_errors)},
-	                              {"slow_fetches", Value::UBIGINT(slow_fetches)},
-	                              {"max_fetch_ms", Value::UBIGINT(max_fetch_ms.exchange(0))},
-	                              {"hedges", Value::UBIGINT(fetch_hedges)}};
+	auto async = GetAsyncRequestStats();
+	child_list_t<Value> values = {{"fetches", Value::UBIGINT(fetch_count + async.requests)},
+	                              {"retries", Value::UBIGINT(fetch_retries + async.retries)},
+	                              {"errors", Value::UBIGINT(fetch_errors + async.errors)},
+	                              {"slow_fetches", Value::UBIGINT(slow_fetches + async.slow)},
+	                              {"max_fetch_ms", Value::UBIGINT(MaxValue(max_fetch_ms.exchange(0), async.max_ms))},
+	                              {"hedges", Value::UBIGINT(fetch_hedges + async.hedges)}};
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	result.SetValue(0, Value::STRUCT(std::move(values)));
 }
@@ -965,6 +1197,14 @@ string MakeValidUtf8(string s) {
 	return copied ? out : s;
 }
 
+void SetWarcFetchStreamSelectors(FunctionData &bind_data, vector<string> selectors) {
+	bind_data.Cast<WarcFetchBindData>().stream_selectors = make_shared_ptr<const vector<string>>(std::move(selectors));
+}
+
+bool IsWarcFetch(const string &function_name) {
+	return function_name == "warc_fetch";
+}
+
 void RegisterWarcFunctions(ExtensionLoader &loader) {
 	auto &config = DBConfig::GetConfig(loader.GetDatabaseInstance());
 	config.AddExtensionOption("warc_base_path", "Prefix for relative WARC file names", LogicalType::VARCHAR,
@@ -981,7 +1221,8 @@ void RegisterWarcFunctions(ExtensionLoader &loader) {
 	auto headers = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
 	child_list_t<LogicalType> children = {{"status", LogicalType::INTEGER},   {"headers", headers},
 	                                      {"body", LogicalType::VARCHAR},     {"charset", LogicalType::VARCHAR},
-	                                      {"warc", headers},                  {"error", LogicalType::VARCHAR}};
+	                                      {"warc", headers},                  {"error", LogicalType::VARCHAR},
+	                                      {"truncated", LogicalType::BOOLEAN}};
 	ScalarFunctionSet warc_record("warc_record");
 	// The optional fourth argument is the charset to use when the page doesn't declare one, e.g. content_charset
 	for (auto arguments : {vector<LogicalType> {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
@@ -1006,6 +1247,7 @@ void RegisterWarcFunctions(ExtensionLoader &loader) {
 	TableFunction warc_fetch("warc_fetch", FunctionSignature().AddPositionalOnly("input", LogicalType::TABLE), nullptr,
 	                         WarcFetchBind, nullptr, WarcFetchInitLocal);
 	warc_fetch.in_out_function = WarcFetchFunction;
+
 	loader.RegisterFunction(warc_fetch);
 
 	ScalarFunction warc_fetch_stats("warc_fetch_stats", {}, LogicalType::STRUCT(stats), WarcFetchStatsFunction);

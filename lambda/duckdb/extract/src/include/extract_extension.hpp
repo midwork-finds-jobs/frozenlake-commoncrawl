@@ -49,6 +49,40 @@ bool IsRetryable(const ErrorData &error);
 //! Inflates one gzip member which must be exactly `size` bytes, at most `limit` bytes after decompression
 string InflateGzipMember(const char *data, idx_t size, idx_t limit);
 
+//! A range request done by the async fetcher, see async_fetch.cpp
+struct AsyncRequest {
+	string url;
+	vector<string> headers;
+	int64_t offset = 0;
+	int64_t length = 0;
+	//! Start a second identical request when this one hasn't finished in this many milliseconds, 0 doesn't hedge
+	idx_t hedge_ms = 0;
+	//! Optional: gets the response as it arrives instead of on_done, returning false stops the transfer
+	std::function<bool(const char *, idx_t)> on_data;
+	//! Whether on_data can start again from the beginning after a failed attempt
+	bool stream_restartable = false;
+	//! Called once on the fetcher thread: the response (empty when streamed), an error or whether on_data stopped it.
+	//! Must be quick and must not throw.
+	std::function<void(string data, string error, bool stopped)> on_done;
+};
+
+struct AsyncRequestStats {
+	idx_t requests = 0, retries = 0, errors = 0, slow = 0, max_ms = 0, hedges = 0;
+};
+
+struct S3Credentials {
+	string key_id, secret, session_token, region, endpoint;
+	//! The S3 secret DuckDB would use for the path
+	static bool Lookup(ClientContext &context, const string &path, S3Credentials &credentials);
+};
+
+//! A signed range request of s3:// paths, or a plain one of http(s):// urls
+AsyncRequest MakeRangeRequest(const string &path, int64_t offset, int64_t length,
+                              optional_ptr<const S3Credentials> credentials);
+void SubmitAsyncRequest(AsyncRequest request);
+void SetAsyncConcurrency(idx_t concurrency);
+AsyncRequestStats GetAsyncRequestStats();
+
 //! Runs the tasks on the process wide fetch pool with at least `concurrency` threads and waits for them.
 //! The tasks must not throw.
 void RunParallel(idx_t concurrency, vector<std::function<void()>> &tasks);
@@ -72,6 +106,27 @@ string MakeValidUtf8(string s);
 //! <meta charset>, then the hint (for example content_charset of the index) and UTF-8 if there is nothing else.
 //! `charset` is set to the WHATWG name of the encoding that was used.
 string ToUtf8(const string &body, const string *content_type, const string &hint, string &charset);
+
+//! Parses HTML as it arrives and tells when the first match of every selector is final, so that the rest of the page
+//! doesn't need to be downloaded. Selectors are like in html_select_first(), including ::attr(x) and ::text.
+class HtmlStreamMatcher {
+public:
+	//! nullptr when a selector depends on what comes after its match, like :has() or :last-child
+	static unique_ptr<HtmlStreamMatcher> Create(const vector<string> &selectors);
+	~HtmlStreamMatcher();
+	//! Parses the next part of the body, true once every selector has its final first match
+	bool Feed(const char *data, idx_t size);
+
+private:
+	HtmlStreamMatcher();
+	struct State;
+	unique_ptr<State> state;
+};
+
+//! Lets warc_fetch() stop reading a record once these selectors have their first match, set by the optimizer
+void SetWarcFetchStreamSelectors(FunctionData &bind_data, vector<string> selectors);
+//! Whether the table function is warc_fetch() and which output column is its record
+bool IsWarcFetch(const string &function_name);
 
 //! html_select, html_select_first, html_extract, html_text and js_object
 void RegisterHtmlFunctions(ExtensionLoader &loader);

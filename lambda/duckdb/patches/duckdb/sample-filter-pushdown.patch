@@ -1,0 +1,29 @@
+--- a/src/optimizer/filter_pushdown.cpp
++++ b/src/optimizer/filter_pushdown.cpp
+@@ -1,4 +1,5 @@
+ #include "duckdb/optimizer/filter_pushdown.hpp"
++#include "duckdb/planner/operator/logical_sample.hpp"
+ #include "duckdb/optimizer/filter_combiner.hpp"
+ #include "duckdb/optimizer/optimizer.hpp"
+ #include "duckdb/planner/expression_iterator.hpp"
+@@ -149,6 +150,20 @@
+ 	}
+ 	case LogicalOperatorType::LOGICAL_GET:
+ 		return PushdownGet(std::move(op));
++	case LogicalOperatorType::LOGICAL_SAMPLE: {
++		// A Bernoulli sample keeps every row independently, so filtering before it gives the same distribution as
++		// filtering after it. A system sample keeps random vectors, which is the same up to the vector boundaries.
++		// Pushing the filters through lets TABLESAMPLE on a table with a WHERE skip files and row groups instead of
++		// scanning the whole table. A reservoir sample of N rows isn't the same when filtered first.
++		auto &sample = op->Cast<LogicalSample>();
++		auto method = sample.sample_options->method;
++		if (method == SampleMethod::BERNOULLI_SAMPLE ||
++		    (method == SampleMethod::SYSTEM_SAMPLE && sample.sample_options->is_percentage)) {
++			op->children[0] = Rewrite(std::move(op->children[0]));
++			return op;
++		}
++		return FinishPushdown(std::move(op));
++	}
+ 	case LogicalOperatorType::LOGICAL_LIMIT:
+ 		return PushdownLimit(std::move(op));
+ 	case LogicalOperatorType::LOGICAL_WINDOW:
