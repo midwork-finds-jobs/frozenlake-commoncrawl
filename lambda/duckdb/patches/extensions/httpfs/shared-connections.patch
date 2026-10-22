@@ -1,0 +1,13 @@
+--- a/src/http/httpfs_transport.cpp
++++ b/src/http/httpfs_transport.cpp
+@@ -91,7 +91,9 @@
+ #ifdef __EMSCRIPTEN__
+ 	return HTTPTransportReusePolicy::CLIENT_FREE;
+ #else
+-	return HTTPTransportReusePolicy::SESSION_LOCAL;
++	// frozenlake-commoncrawl: reuse connections across file handles. warc_record() opens a handle for every record
++	// and a new TLS connection for each one took ~7ms of CPU.
++	return HTTPTransportReusePolicy::SHARED;
+ #endif
+ }
+ 
