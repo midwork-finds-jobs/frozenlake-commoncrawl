@@ -57,17 +57,16 @@ struct AsyncRequest {
 	int64_t length = 0;
 	//! Start a second identical request when this one hasn't finished in this many milliseconds, 0 doesn't hedge
 	idx_t hedge_ms = 0;
-	//! Optional: gets the response as it arrives instead of on_done, returning false stops the transfer
-	std::function<bool(const char *, idx_t)> on_data;
-	//! Whether on_data can start again from the beginning after a failed attempt
-	bool stream_restartable = false;
-	//! Called once on the fetcher thread: the response (empty when streamed), an error or whether on_data stopped it.
-	//! Must be quick and must not throw.
-	std::function<void(string data, string error, bool stopped)> on_done;
+	//! Called once on the fetcher thread with the response or an error. Must be quick and must not throw.
+	std::function<void(string data, string error)> on_done;
 };
 
 struct AsyncRequestStats {
 	idx_t requests = 0, retries = 0, errors = 0, slow = 0, max_ms = 0, hedges = 0;
+	//! Why the last retried request failed
+	string last_retry;
+	//! Phases of the slowest transfer since the last call
+	string slowest;
 };
 
 struct S3Credentials {

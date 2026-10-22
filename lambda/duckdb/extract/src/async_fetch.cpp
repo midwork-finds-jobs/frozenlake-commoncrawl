@@ -5,9 +5,6 @@
 // credentials of the S3 secret which DuckDB would use for the path. A request which hasn't finished in hedge_ms gets
 // a second identical request and the first one to finish wins, the other one is cancelled. Throttling, server
 // errors and connection problems are retried.
-//
-// A request can stream its response to a callback, which can stop the transfer early, for example when the part of
-// the page the query needs has arrived.
 
 #include "extract_extension.hpp"
 
@@ -18,6 +15,8 @@
 #include <curl/curl.h>
 #include <openssl/hmac.h>
 #include <openssl/sha.h>
+#include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include <atomic>
 #include <chrono>
@@ -25,6 +24,7 @@
 #include <ctime>
 #include <deque>
 #include <mutex>
+#include <random>
 #include <thread>
 #include <unistd.h>
 #include <algorithm>
@@ -86,8 +86,41 @@ string CaBundle() {
 	return string();
 }
 
+//! The first certificate of a PEM bundle
+string FirstPemCertificate(const string &path) {
+	static const string END = "-----END CERTIFICATE-----";
+	auto file = fopen(path.c_str(), "r");
+	if (!file) {
+		return string();
+	}
+	string content;
+	char buffer[4096];
+	size_t read;
+	while ((read = fread(buffer, 1, sizeof(buffer), file)) > 0 && content.find(END) == string::npos) {
+		content.append(buffer, read);
+	}
+	fclose(file);
+	auto begin = content.find("-----BEGIN CERTIFICATE-----");
+	auto end = content.find(END);
+	if (begin == string::npos || end == string::npos) {
+		return string();
+	}
+	return content.substr(begin, end + END.size() - begin) + "\n";
+}
+
+//! Replaces the CA store curl built for a connection with the one parsed once
+CURLcode SetCaStore(CURL *, void *ssl_ctx, void *store) {
+	SSL_CTX_set1_cert_store(static_cast<SSL_CTX *>(ssl_ctx), static_cast<X509_STORE *>(store));
+	return CURLE_OK;
+}
+
 std::atomic<idx_t> request_count(0), request_retries(0), request_errors(0), slow_requests(0), max_request_ms(0),
     request_hedges(0);
+
+std::mutex last_retry_lock;
+string last_retry;
+string slowest;
+idx_t slowest_us = 0;
 
 struct Transfer;
 
@@ -95,6 +128,7 @@ struct Transfer;
 struct Request {
 	AsyncRequest request;
 	idx_t attempts = 0;
+	//! When the request left the queue, waiting for a free transfer isn't slowness of S3
 	Clock::time_point started;
 	Clock::time_point retry_at;
 	bool finished = false;
@@ -107,25 +141,13 @@ struct Transfer {
 	curl_slist *headers = nullptr;
 	shared_ptr<Request> request;
 	string data;
-	bool stopped = false;
-	bool streaming = false;
 	char error[CURL_ERROR_SIZE] = {0};
 };
 
 size_t WriteCallback(char *data, size_t size, size_t count, void *pointer) {
 	auto &transfer = *static_cast<Transfer *>(pointer);
-	auto bytes = size * count;
-	if (transfer.streaming) {
-		// Only the transfer which streams first gets to stream, a hedged transfer isn't started for streams
-		if (!transfer.request->request.on_data(data, bytes)) {
-			transfer.stopped = true;
-			// Returning less than bytes aborts the transfer with CURLE_WRITE_ERROR
-			return 0;
-		}
-		return bytes;
-	}
-	transfer.data.append(data, bytes);
-	return bytes;
+	transfer.data.append(data, size * count);
+	return size * count;
 }
 
 class Fetcher {
@@ -139,7 +161,6 @@ public:
 	void Submit(AsyncRequest request) {
 		auto pending = make_shared_ptr<Request>();
 		pending->request = std::move(request);
-		pending->started = Clock::now();
 		{
 			std::lock_guard<std::mutex> guard(lock);
 			queue.push_back(std::move(pending));
@@ -151,17 +172,42 @@ public:
 		concurrency = MaxValue<idx_t>(1, value);
 	}
 
+	static constexpr idx_t MAX_ATTEMPTS = 5;
+	static constexpr idx_t BASE_BACKOFF_MS = 100;
+	static constexpr idx_t MAX_BACKOFF_MS = 3000;
+	//! Throttling never lowers the concurrency below this
+	static constexpr double MIN_ALLOWED = 8;
+
 private:
 	CURLM *multi;
 	CURLSH *share;
 	string ca_bundle;
+	//! The CA bundle parsed once. curl would parse it for every new connection: it caches it only without a CA
+	//! directory and vcpkg builds it with /etc/ssl/certs, which took 30% of the CPU when opening 128 connections.
+	X509_STORE *ca_store = nullptr;
+	//! curl still builds a store for every connection before SetCaStore() replaces it, from this one certificate
+	string placeholder_ca;
 	std::mutex lock;
 	std::deque<shared_ptr<Request>> queue;
 	//! Owned by the fetcher thread
 	vector<shared_ptr<Request>> retrying;
 	vector<shared_ptr<Request>> running;
 	std::atomic<idx_t> concurrency {256};
+	//! Requests allowed at a time: lowered when S3 throttles (SlowDown), owned by the fetcher thread
+	double allowed = 1e9;
+	Clock::time_point last_throttle;
+	std::mt19937_64 random {std::random_device()()};
 	idx_t transfers = 0;
+
+	//! Multiplicative decrease, at most once per 200ms because S3 throttles a burst of requests at once
+	void Throttled() {
+		auto now = Clock::now();
+		if (now - last_throttle < std::chrono::milliseconds(200)) {
+			return;
+		}
+		last_throttle = now;
+		allowed = MaxValue(MIN_ALLOWED, MinValue<double>(allowed, double(transfers)) * 0.7);
+	}
 
 	Fetcher() {
 		curl_global_init(CURL_GLOBAL_DEFAULT);
@@ -171,13 +217,20 @@ private:
 		curl_share_setopt(share, CURLSHOPT_SHARE, CURL_LOCK_DATA_SSL_SESSION);
 		curl_multi_setopt(multi, CURLMOPT_MAXCONNECTS, long(1024));
 		ca_bundle = CaBundle();
+		placeholder_ca = ca_bundle.empty() ? string() : FirstPemCertificate(ca_bundle);
+		if (!placeholder_ca.empty()) {
+			ca_store = X509_STORE_new();
+			if (ca_store && X509_STORE_load_file(ca_store, ca_bundle.c_str()) != 1) {
+				X509_STORE_free(ca_store);
+				ca_store = nullptr;
+			}
+		}
 		std::thread([this]() { Run(); }).detach();
 	}
 
 	void Start(const shared_ptr<Request> &request) {
 		auto transfer = new Transfer();
 		transfer->request = request;
-		transfer->streaming = bool(request->request.on_data);
 		transfer->easy = curl_easy_init();
 		auto easy = transfer->easy;
 		curl_easy_setopt(easy, CURLOPT_URL, request->request.url.c_str());
@@ -195,10 +248,15 @@ private:
 		curl_easy_setopt(easy, CURLOPT_TIMEOUT_MS, long(60000));
 		curl_easy_setopt(easy, CURLOPT_TCP_KEEPALIVE, long(1));
 		curl_easy_setopt(easy, CURLOPT_FOLLOWLOCATION, long(1));
-		if (!ca_bundle.empty()) {
+		if (ca_store) {
+			curl_blob blob {const_cast<char *>(placeholder_ca.data()), placeholder_ca.size(), CURL_BLOB_NOCOPY};
+			curl_easy_setopt(easy, CURLOPT_CAINFO_BLOB, &blob);
+			curl_easy_setopt(easy, CURLOPT_SSL_CTX_FUNCTION, SetCaStore);
+			curl_easy_setopt(easy, CURLOPT_SSL_CTX_DATA, ca_store);
+		} else if (!ca_bundle.empty()) {
 			curl_easy_setopt(easy, CURLOPT_CAINFO, ca_bundle.c_str());
 		}
-		if (!transfer->streaming && request->request.length > 0) {
+		if (request->request.length > 0) {
 			transfer->data.reserve(NumericCast<idx_t>(request->request.length));
 		}
 		request->transfers.push_back(transfer);
@@ -218,12 +276,12 @@ private:
 
 	static bool Retryable(CURLcode code, long status) {
 		if (code != CURLE_OK) {
-			return code != CURLE_WRITE_ERROR;
+			return true;
 		}
 		return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
 	}
 
-	void Finish(const shared_ptr<Request> &request, string data, string error, bool stopped) {
+	void Finish(const shared_ptr<Request> &request, string data, string error) {
 		request->finished = true;
 		for (auto transfer : vector<Transfer *>(request->transfers)) {
 			Remove(transfer);
@@ -240,8 +298,25 @@ private:
 		for (auto max = max_request_ms.load(); elapsed > max && !max_request_ms.compare_exchange_weak(max, elapsed);) {
 		}
 		try {
-			request->request.on_done(std::move(data), std::move(error), stopped);
+			request->request.on_done(std::move(data), std::move(error));
 		} catch (...) {
+		}
+	}
+
+	//! Remembers where the slowest transfer since the last stats call spent its time
+	static void RecordPhases(CURL *easy) {
+		curl_off_t dns = 0, connect = 0, tls = 0, first_byte = 0, total = 0;
+		curl_easy_getinfo(easy, CURLINFO_NAMELOOKUP_TIME_T, &dns);
+		curl_easy_getinfo(easy, CURLINFO_CONNECT_TIME_T, &connect);
+		curl_easy_getinfo(easy, CURLINFO_APPCONNECT_TIME_T, &tls);
+		curl_easy_getinfo(easy, CURLINFO_STARTTRANSFER_TIME_T, &first_byte);
+		curl_easy_getinfo(easy, CURLINFO_TOTAL_TIME_T, &total);
+		std::lock_guard<std::mutex> guard(last_retry_lock);
+		if (idx_t(total) > slowest_us) {
+			slowest_us = idx_t(total);
+			slowest = StringUtil::Format("dns=%lldms connect=%lldms tls=%lldms first_byte=%lldms total=%lldms",
+			                             (long long)dns / 1000, (long long)connect / 1000, (long long)tls / 1000,
+			                             (long long)first_byte / 1000, (long long)total / 1000);
 		}
 	}
 
@@ -253,20 +328,18 @@ private:
 		}
 		long status = 0;
 		curl_easy_getinfo(transfer->easy, CURLINFO_RESPONSE_CODE, &status);
-		if (transfer->stopped) {
-			Finish(request, string(), string(), true);
-			return;
-		}
+		RecordPhases(transfer->easy);
 		if (code == CURLE_OK && (status == 200 || status == 206)) {
 			auto data = std::move(transfer->data);
-			if (!transfer->streaming && request->request.length > 0 &&
+			if (request->request.length > 0 &&
 			    data.size() != NumericCast<idx_t>(request->request.length)) {
-				Finish(request, string(), StringUtil::Format("expected %lld bytes but got %llu", request->request.length,
-				                                             data.size()),
-				       false);
+				Finish(request, string(),
+				       StringUtil::Format("expected %lld bytes but got %llu", request->request.length, data.size()));
 				return;
 			}
-			Finish(request, std::move(data), string(), false);
+			// Additive increase back to the configured concurrency after throttling
+			allowed = MinValue<double>(double(concurrency), allowed + 0.25);
+			Finish(request, std::move(data), string());
 			return;
 		}
 		string error = code != CURLE_OK ? StringUtil::Format("%s: %s", curl_easy_strerror(code), transfer->error)
@@ -276,24 +349,33 @@ private:
 			// The hedged transfer can still succeed
 			return;
 		}
-		// A streamed response can't be retried once the callback got data
-		bool can_retry = !request->request.on_data || request->request.stream_restartable;
-		if (can_retry && Retryable(code, status) && ++request->attempts <= 3) {
+		if (status == 429 || status == 503) {
+			Throttled();
+		}
+		if (Retryable(code, status) && ++request->attempts <= MAX_ATTEMPTS) {
 			request_retries++;
-			request->retry_at = Clock::now() + std::chrono::milliseconds(200 << request->attempts);
+			{
+				std::lock_guard<std::mutex> guard(last_retry_lock);
+				last_retry = error;
+			}
+			// Exponential backoff with full jitter like the AWS SDKs. Without jitter the requests which S3 throttled
+			// together were retried together and throttled again.
+			auto cap = MinValue<idx_t>(MAX_BACKOFF_MS, BASE_BACKOFF_MS << request->attempts);
+			request->retry_at = Clock::now() + std::chrono::milliseconds(std::uniform_int_distribution<idx_t>(0, cap)(random));
 			retrying.push_back(request);
 			return;
 		}
-		Finish(request, string(), error, false);
+		Finish(request, string(), error);
 	}
 
 	void Run() {
 		while (true) {
 			{
 				std::lock_guard<std::mutex> guard(lock);
-				while (!queue.empty() && transfers < concurrency) {
+				while (!queue.empty() && transfers < MinValue<idx_t>(concurrency, idx_t(allowed))) {
 					auto request = std::move(queue.front());
 					queue.pop_front();
+					request->started = Clock::now();
 					running.push_back(request);
 					Start(request);
 				}
@@ -301,6 +383,7 @@ private:
 			auto now = Clock::now();
 			for (idx_t i = 0; i < retrying.size();) {
 				if (retrying[i]->retry_at <= now) {
+					retrying[i]->started = now;
 					Start(retrying[i]);
 					retrying.erase(retrying.begin() + i);
 				} else {
@@ -310,7 +393,7 @@ private:
 			// Hedge slow requests, streams can't be duplicated
 			for (auto &request : running) {
 				auto hedge_ms = request->request.hedge_ms;
-				if (!request->finished && !request->hedged && hedge_ms > 0 && !request->request.on_data &&
+				if (!request->finished && !request->hedged && hedge_ms > 0 &&
 				    request->transfers.size() == 1 && now - request->started > std::chrono::milliseconds(hedge_ms)) {
 					request->hedged = true;
 					request_hedges++;
@@ -355,6 +438,11 @@ AsyncRequestStats GetAsyncRequestStats() {
 	stats.slow = slow_requests;
 	stats.max_ms = max_request_ms.exchange(0);
 	stats.hedges = request_hedges;
+	std::lock_guard<std::mutex> guard(last_retry_lock);
+	stats.last_retry = last_retry;
+	stats.slowest = std::move(slowest);
+	slowest.clear();
+	slowest_us = 0;
 	return stats;
 }
 

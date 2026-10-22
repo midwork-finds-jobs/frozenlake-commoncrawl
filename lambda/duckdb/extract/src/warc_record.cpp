@@ -107,7 +107,7 @@ struct FetchedRecord {
 	vector<pair<string, string>> http_headers;
 	string body;
 	string error;
-	//! The body was cut by warc_fetch(until := ..., max_bytes := ...)
+	//! warc_fetch() read only the beginning of the record because it had the first matches the query needs
 	bool truncated = false;
 };
 
@@ -497,8 +497,10 @@ struct FetchJob {
 constexpr idx_t MAX_ASYNC_REQUESTS = 768;
 //! Threads for reading local files, remote ones are read by the async fetcher
 constexpr idx_t LOCAL_READ_THREADS = 32;
-//! Threads which parse streamed records
+//! Threads which parse the beginnings of records
 constexpr idx_t STREAM_THREADS = 8;
+//! Compressed bytes fetched first when the query only needs first matches, ~200KB of HTML
+constexpr int64_t STREAM_FIRST_BYTES = 32 * 1024;
 
 struct FetchSettings {
 	explicit FetchSettings(ClientContext &context)
@@ -560,8 +562,8 @@ bool MakeJob(const FetchSettings &settings, UnifiedVectorFormat &files, UnifiedV
 //! First match selectors of the query which reads the records, see SetWarcFetchStreamSelectors()
 using StreamSelectors = shared_ptr<const vector<string>>;
 
-//! Inflates a gzip member as it arrives and parses its HTML body incrementally until every selector the query needs
-//! has its final first match, so the rest of the record isn't downloaded or inflated at all
+//! Inflates the beginning of a gzip member and parses its HTML body incrementally until every selector the query
+//! needs has its final first match
 class StreamingRecord {
 public:
 	explicit StreamingRecord(StreamSelectors selectors_p) : selectors(std::move(selectors_p)) {
@@ -688,50 +690,9 @@ bool IsRemote(const string &path) {
 }
 
 //! Starts fetching a record. The slot is filled and the waiter notified when it's done, never throws.
-//! Parses a streamed record on the fetch pool so that the fetcher thread only moves bytes. Chunks are queued and one
-//! pool task at a time works through them, setting stop once the record has what the query needs.
-struct StreamTask {
-	explicit StreamTask(StreamSelectors selectors) : record(std::move(selectors)) {
-	}
-	std::mutex lock;
-	std::deque<string> chunks;
-	bool scheduled = false;
-	bool ended = false;
-	bool finalized = false;
-	string error;
-	std::atomic<bool> stop {false};
-	StreamingRecord record;
-	std::function<void(StreamTask &)> finalize;
-
-	//! Runs finalize once both the transfer and the parsing are done
-	void FinalizeIfDone(std::unique_lock<std::mutex> &guard) {
-		if (ended && !scheduled && !finalized) {
-			finalized = true;
-			guard.unlock();
-			finalize(*this);
-		}
-	}
-
-	static void Process(const shared_ptr<StreamTask> &task) {
-		while (true) {
-			string chunk;
-			{
-				std::unique_lock<std::mutex> guard(task->lock);
-				if (task->chunks.empty()) {
-					task->scheduled = false;
-					task->FinalizeIfDone(guard);
-					return;
-				}
-				chunk = std::move(task->chunks.front());
-				task->chunks.pop_front();
-			}
-			if (!task->stop && !task->record.Feed(chunk.data(), chunk.size())) {
-				task->stop = true;
-			}
-		}
-	}
-};
-
+//! When the query only needs first matches of selectors, the first STREAM_FIRST_BYTES of the record are fetched and
+//! parsed first and the rest only if the matches weren't in them. Aborting a transfer as soon as the matches arrive
+//! would close its connection, and new TLS connections cost more than the bytes saved.
 void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelectors &stream_selectors,
                 const shared_ptr<FetchWaiter> &waiter, const shared_ptr<FetchSlot> &slot) {
 	auto finish = [waiter, slot](string data, string error, bool decompressed, bool truncated) {
@@ -779,47 +740,47 @@ void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelect
 		if (StringUtil::StartsWith(job.path, "s3://")) {
 			credentials = settings.Credentials(job.path);
 		}
-		auto request = MakeRangeRequest(job.path, job.offset, job.length, credentials);
-		request.hedge_ms = settings.hedge_ms;
-		if (stream_selectors) {
+		auto hedge_ms = settings.hedge_ms;
+		if (stream_selectors && job.length > STREAM_FIRST_BYTES) {
 			FetchPool::Get().EnsureThreads(STREAM_THREADS);
-			auto task = make_shared_ptr<StreamTask>(stream_selectors);
-			task->finalize = [finish](StreamTask &task) {
-				if (task.record.failed) {
-					finish(string(), "invalid gzip data", false, false);
-				} else if (!task.error.empty() && !task.stop) {
-					finish(string(), task.error, false, false);
-				} else {
-					finish(std::move(task.record.out), string(), true, bool(task.stop) && !task.record.finished);
+			auto first = MakeRangeRequest(job.path, job.offset, STREAM_FIRST_BYTES, credentials);
+			first.hedge_ms = hedge_ms;
+			// The credentials of the bucket are cached by the settings which live as long as the query
+			auto rest = make_shared_ptr<AsyncRequest>(MakeRangeRequest(
+			    job.path, job.offset + STREAM_FIRST_BYTES, job.length - STREAM_FIRST_BYTES, credentials));
+			rest->hedge_ms = hedge_ms;
+			first.on_done = [stream_selectors, rest, finish](string head, string error) {
+				if (!error.empty()) {
+					finish(string(), std::move(error), false, false);
+					return;
 				}
+				// Parsing doesn't belong on the fetcher thread
+				auto data = make_shared_ptr<string>(std::move(head));
+				FetchPool::Get().Submit([stream_selectors, rest, finish, data]() {
+					StreamingRecord record(stream_selectors);
+					auto more = record.Feed(data->data(), data->size());
+					if (!more && !record.failed) {
+						finish(std::move(record.out), string(), true, true);
+						return;
+					}
+					rest->on_done = [finish, data](string tail, string error) {
+						if (!error.empty()) {
+							finish(string(), std::move(error), false, false);
+							return;
+						}
+						finish(*data + tail, string(), false, false);
+					};
+					SubmitAsyncRequest(std::move(*rest));
+				});
 			};
-			request.on_data = [task](const char *data, idx_t size) {
-				if (task->stop) {
-					return false;
-				}
-				bool schedule = false;
-				{
-					std::lock_guard<std::mutex> guard(task->lock);
-					task->chunks.emplace_back(data, size);
-					schedule = !task->scheduled;
-					task->scheduled = true;
-				}
-				if (schedule) {
-					FetchPool::Get().Submit([task]() { StreamTask::Process(task); });
-				}
-				return true;
-			};
-			request.on_done = [task](string, string error, bool) {
-				std::unique_lock<std::mutex> guard(task->lock);
-				task->ended = true;
-				task->error = std::move(error);
-				task->FinalizeIfDone(guard);
-			};
-		} else {
-			request.on_done = [finish](string data, string error, bool) {
-				finish(std::move(data), std::move(error), false, false);
-			};
+			SubmitAsyncRequest(std::move(first));
+			return;
 		}
+		auto request = MakeRangeRequest(job.path, job.offset, job.length, credentials);
+		request.hedge_ms = hedge_ms;
+		request.on_done = [finish](string data, string error) {
+			finish(std::move(data), std::move(error), false, false);
+		};
 		SubmitAsyncRequest(std::move(request));
 	} catch (std::exception &ex) {
 		finish(string(), ErrorData(ex).RawMessage(), false, false);
@@ -1139,7 +1100,9 @@ void WarcFetchStatsFunction(DataChunk &args, ExpressionState &state, Vector &res
 	                              {"errors", Value::UBIGINT(fetch_errors + async.errors)},
 	                              {"slow_fetches", Value::UBIGINT(slow_fetches + async.slow)},
 	                              {"max_fetch_ms", Value::UBIGINT(MaxValue(max_fetch_ms.exchange(0), async.max_ms))},
-	                              {"hedges", Value::UBIGINT(fetch_hedges + async.hedges)}};
+	                              {"hedges", Value::UBIGINT(fetch_hedges + async.hedges)},
+	                              {"last_retry", async.last_retry.empty() ? Value(LogicalType::VARCHAR) : Value(async.last_retry)},
+	                              {"slowest", async.slowest.empty() ? Value(LogicalType::VARCHAR) : Value(async.slowest)}};
 	result.SetVectorType(VectorType::CONSTANT_VECTOR);
 	result.SetValue(0, Value::STRUCT(std::move(values)));
 }
@@ -1243,7 +1206,9 @@ void RegisterWarcFunctions(ExtensionLoader &loader) {
 	                                   {"errors", LogicalType::UBIGINT},
 	                                   {"slow_fetches", LogicalType::UBIGINT},
 	                                   {"max_fetch_ms", LogicalType::UBIGINT},
-	                                   {"hedges", LogicalType::UBIGINT}};
+	                                   {"hedges", LogicalType::UBIGINT},
+	                                   {"last_retry", LogicalType::VARCHAR},
+	                                   {"slowest", LogicalType::VARCHAR}};
 	TableFunction warc_fetch("warc_fetch", FunctionSignature().AddPositionalOnly("input", LogicalType::TABLE), nullptr,
 	                         WarcFetchBind, nullptr, WarcFetchInitLocal);
 	warc_fetch.in_out_function = WarcFetchFunction;
