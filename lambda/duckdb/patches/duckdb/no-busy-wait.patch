@@ -1,0 +1,38 @@
+--- a/src/main/buffered_data/buffered_data.cpp	2026-10-22 13:00:38
++++ b/src/main/buffered_data/buffered_data.cpp	2026-10-22 13:00:38
+@@ -168,6 +168,9 @@
+ 		if (execution_result == QueryResultState::BLOCKED) {
+ 			UnblockSinks();
+ 			cc->WaitForTask(context_lock, result);
++		} else if (execution_result == QueryResultState::NO_TASKS_AVAILABLE) {
++			// Wait instead of spinning while all tasks run on other threads
++			cc->WaitForTask(context_lock, result);
+ 		}
+ 	}
+ 	if (result.HasError()) {
+--- a/src/main/client_context_execution.cpp	2026-10-22 13:00:38
++++ b/src/main/client_context_execution.cpp	2026-10-22 13:00:38
+@@ -347,7 +347,8 @@
+ unique_ptr<QueryResult> ClientContext::CompleteDelegatedInternal(ClientContextLock &lock, QueryResult &result) {
+ 	QueryResultState state;
+ 	while (!IsObservable(state = ExecuteTaskInternal(lock, result))) {
+-		if (state == QueryResultState::BLOCKED) {
++		// Wait instead of spinning while all tasks run on other threads
++		if (state == QueryResultState::BLOCKED || state == QueryResultState::NO_TASKS_AVAILABLE) {
+ 			WaitForTask(lock, result);
+ 		}
+ 	}
+--- a/src/main/query_result.cpp	2026-10-22 13:00:38
++++ b/src/main/query_result.cpp	2026-10-22 13:00:38
+@@ -424,7 +424,10 @@
+ 	try {
+ 		QueryResultState state;
+ 		while (!IsTerminal(state = context->ExecuteTaskInternal(lock, *this))) {
+-			if (state == QueryResultState::BLOCKED || state == QueryResultState::READY) {
++			// Wait instead of spinning while all tasks run on other threads, for example a scalar function which
++			// waits for network requests
++			if (state == QueryResultState::BLOCKED || state == QueryResultState::READY ||
++			    state == QueryResultState::NO_TASKS_AVAILABLE) {
+ 				context->WaitForTask(lock, *this);
+ 			}
+ 		}

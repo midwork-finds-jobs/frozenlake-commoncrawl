@@ -41,6 +41,24 @@ variable "memory_size" {
   default     = 3008
 }
 
+variable "warc_concurrency" {
+  description = "Parallel S3 range requests per vector of warc_record() in the lambda"
+  type        = number
+  default     = 128
+}
+
+variable "duckdb_threads" {
+  description = "DuckDB threads of the lambda. Reading S3 is network bound so more than the 2 vCPUs, but every thread can hold a vector of fetched pages in memory."
+  type        = number
+  default     = 16
+}
+
+variable "gb_seconds_limit" {
+  description = "The lambda refuses queries when this function has used this many GB-seconds in the calendar month. 400 000 is the free tier, 0 disables the limit."
+  type        = number
+  default     = 400000
+}
+
 variable "origin_read_timeout" {
   description = "Seconds CloudFront waits for bytes from the lambda. Defaults to the current quota, see README.md."
   type        = number
@@ -60,7 +78,7 @@ data "aws_servicequotas_service_quota" "lambda_network_bandwidth" {
 
 data "aws_caller_identity" "current" {}
 
-# Bucket for the catalog and the lambda package
+# Bucket for the lambda package and large query results
 resource "aws_s3_bucket" "artifacts" {
   bucket_prefix = "${var.name}-artifacts-"
   force_destroy = true
@@ -107,14 +125,6 @@ resource "aws_s3_bucket_policy" "artifacts" {
   })
 }
 
-resource "aws_s3_object" "catalog" {
-  bucket = aws_s3_bucket.artifacts.id
-  key    = "commoncrawl.ducklake"
-  source = var.catalog_path
-  # etag isn't a md5 for multipart uploads
-  source_hash = filemd5(var.catalog_path)
-}
-
 resource "aws_s3_object" "lambda_package" {
   bucket      = aws_s3_bucket.artifacts.id
   key         = "lambda.zip"
@@ -122,7 +132,7 @@ resource "aws_s3_object" "lambda_package" {
   source_hash = filemd5(var.lambda_package)
 }
 
-# Lambda can only read Common Crawl and the catalog
+# Lambda can only read Common Crawl
 resource "aws_iam_role" "lambda" {
   name_prefix = "${var.name}-lambda-"
   assume_role_policy = jsonencode({
@@ -146,14 +156,21 @@ resource "aws_iam_role_policy" "lambda_s3" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["s3:GetObject"]
-        Resource = ["arn:aws:s3:::commoncrawl/cc-index/*", "${aws_s3_bucket.artifacts.arn}/${aws_s3_object.catalog.key}"]
+        Effect = "Allow"
+        Action = ["s3:GetObject"]
+        # cc-index has the parquet files, crawl-data the WARC files read by warc_record()
+        Resource = ["arn:aws:s3:::commoncrawl/cc-index/*", "arn:aws:s3:::commoncrawl/crawl-data/*"]
       },
       {
         Effect   = "Allow"
         Action   = ["s3:PutObject", "s3:AbortMultipartUpload"]
         Resource = ["${aws_s3_bucket.artifacts.arn}/results/*"]
+      },
+      {
+        # Billed duration of this month for gb_seconds_limit, the action doesn't support resource restrictions
+        Effect   = "Allow"
+        Action   = ["cloudwatch:GetMetricStatistics"]
+        Resource = ["*"]
       },
     ]
   })
@@ -171,9 +188,7 @@ locals {
   origin_read_timeout = coalesce(var.origin_read_timeout, data.aws_servicequotas_service_quota.cloudfront_response_timeout.value)
 
   catalog_env = {
-    CATALOG_BUCKET = aws_s3_bucket.artifacts.id
-    CATALOG_KEY    = aws_s3_object.catalog.key
-    # Changes the version so warm lambdas pick up a new catalog
+    # The catalog is in the lambda package, see lambda/build.sh. Part of the result cache key.
     CATALOG_MD5 = filemd5(var.catalog_path)
   }
 }
@@ -198,13 +213,19 @@ resource "aws_lambda_function" "query" {
   # CloudFront gives up after this so there's no reason to keep running and spending lambda seconds
   timeout = local.origin_read_timeout
 
-  # The catalog is downloaded into /tmp
+  # DuckDB spills larger than memory operators into /tmp/duckdb
   ephemeral_storage {
     size = 2048
   }
 
   environment {
-    variables = merge(local.catalog_env, { RESULTS_BUCKET = aws_s3_bucket.artifacts.id })
+    variables = merge(local.catalog_env, {
+      RESULTS_BUCKET   = aws_s3_bucket.artifacts.id
+      WARC_CONCURRENCY = tostring(var.warc_concurrency)
+      GB_SECONDS_LIMIT = tostring(var.gb_seconds_limit)
+      TIMEOUT_SECONDS  = tostring(local.origin_read_timeout)
+      DUCKDB_THREADS   = tostring(var.duckdb_threads)
+    })
   }
 
   depends_on = [aws_cloudwatch_log_group.query, aws_iam_role_policy.lambda_s3]
@@ -267,7 +288,8 @@ resource "aws_cloudfront_origin_access_control" "lambda" {
 resource "aws_cloudfront_cache_policy" "query" {
   name        = "${var.name}-query"
   min_ttl     = 0
-  default_ttl = 86400
+  # Only responses with Cache-Control are cached: successful queries. Lambda runtime errors have none.
+  default_ttl = 0
   max_ttl     = 31536000
 
   parameters_in_cache_key_and_forwarded_to_origin {

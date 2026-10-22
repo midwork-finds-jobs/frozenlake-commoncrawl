@@ -17,6 +17,7 @@ import signal
 import sys
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 import duckdb
@@ -111,6 +112,9 @@ UNUSED_STATS_COLUMNS = (
     "fetch_redirect",
 )
 
+COLLINFO_URL = "https://index.commoncrawl.org/collinfo.json"
+COLLINFO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "collinfo.json")
+
 # Common Crawl files are sorted by url_surtkey so filtering with it skips most files.
 # SURT reverses the host: https://www.yle.fi/uutiset/ -> fi,yle)/uutiset
 SURT_MACROS = r"""
@@ -118,10 +122,21 @@ SURT_MACROS = r"""
     CREATE MACRO surt_host(host) AS
         array_to_string(list_reverse(string_split(regexp_replace(lower(host), '^www[0-9]*\.', ''), '.')), ',');
 
-    -- https://yle.fi/uutiset -> fi,yle)/uutiset
+    -- yle.fi/uutiset?a=1#top -> yle.fi/uutiset?a=1, without the scheme and the fragment
+    CREATE MACRO surt_rest(url) AS
+        regexp_replace(regexp_replace(url, '^[a-z][a-z0-9+.-]*://', '', 'i'), '#.*$', '');
+
+    -- Host and port of the url
+    CREATE MACRO surt_authority(url) AS regexp_extract(surt_rest(url), '^[^/?]*');
+
+    -- https://yle.fi/uutiset -> fi,yle)/uutiset. Default ports are dropped like in Common Crawl's keys.
     CREATE MACRO surt_prefix(url) AS
-        surt_host(split_part(regexp_replace(url, '^[a-z]+://', ''), '/', 1)) || ')'
-        || lower(substr(regexp_replace(url, '^[a-z]+://', ''), length(split_part(regexp_replace(url, '^[a-z]+://', ''), '/', 1)) + 1));
+        surt_host(regexp_replace(surt_authority(url), ':[0-9]*$', ''))
+        || CASE WHEN regexp_extract(surt_authority(url), ':([0-9]+)$', 1) IN ('', '80', '443') THEN ''
+                ELSE ':' || regexp_extract(surt_authority(url), ':([0-9]+)$', 1) END
+        || ')'
+        || CASE WHEN starts_with(substr(surt_rest(url), length(surt_authority(url)) + 1), '?') THEN '/' ELSE '' END
+        || lower(substr(surt_rest(url), length(surt_authority(url)) + 1));
 
     -- Pages of the host and its subdomains. ')' ends the host and ',' continues to a subdomain, both are before '-'.
     CREATE MACRO surtkey_in_domain(url_surtkey, domain) AS
@@ -135,8 +150,61 @@ SURT_MACROS = r"""
     CREATE MACRO surtkey_starts_with(url_surtkey, url) AS
         url_surtkey >= surt_prefix(url) AND url_surtkey < surt_prefix(url) || chr(127);
 
+    -- SURT key of one url like in url_surtkey: https://yle.fi/uutiset/ -> fi,yle)/uutiset, https://yle.fi -> fi,yle)/
+    -- and https://yle.fi/a/?s=1&a=2 -> fi,yle)/a?a=2&s=1 with the query parameters sorted like Common Crawl does.
+    CREATE MACRO surt_url(url) AS
+        CASE WHEN NOT contains(surt_prefix(url), ')/') THEN surt_prefix(url) || '/'
+             ELSE regexp_replace(split_part(surt_prefix(url), '?', 1), '([^)])/$', '\1')
+                  || CASE WHEN contains(surt_prefix(url), '?')
+                          THEN '?' || array_to_string(list_sort(string_split(
+                              substr(surt_prefix(url), strpos(surt_prefix(url), '?') + 1), '&')), '&')
+                          ELSE '' END END;
+
     CREATE MACRO domain_pages(domain) AS TABLE
         FROM archives WHERE surtkey_in_domain(url_surtkey, domain);
+
+    -- Pages of exactly this host
+    CREATE MACRO host_pages(host) AS TABLE
+        FROM archives WHERE surtkey_in_host(url_surtkey, host);
+
+    -- Every capture of one url in every crawl. The scheme and www. don't matter.
+    CREATE MACRO url_captures(page_url) AS TABLE
+        SELECT crawl, subset, url, fetch_time, fetch_status, fetch_redirect, content_mime_detected,
+            content_languages, content_digest, warc_filename, warc_record_offset, warc_record_length
+        FROM archives WHERE url_surtkey = surt_url(page_url) ORDER BY fetch_time;
+
+    -- Pages, hosts and fetch times of a domain in every crawl
+    CREATE MACRO domain_history(domain) AS TABLE
+        SELECT crawl, count(*) AS pages, count(*) FILTER (fetch_status = 200) AS ok_pages,
+            count(DISTINCT url_host_name) AS hosts, min(fetch_time) AS first_fetch, max(fetch_time) AS last_fetch
+        FROM domain_pages(domain) WHERE subset = 'warc' GROUP BY crawl ORDER BY crawl;
+
+    -- Subdomains of a domain with the crawls they were seen in
+    CREATE MACRO domain_hosts(domain) AS TABLE
+        SELECT url_host_name AS host, count(*) AS pages, min(crawl) AS first_crawl, max(crawl) AS last_crawl
+        FROM domain_pages(domain) WHERE subset = 'warc' GROUP BY ALL ORDER BY pages DESC;
+
+    -- Distinct urls of a host with the crawls they were seen in
+    CREATE MACRO host_urls(host) AS TABLE
+        SELECT url, count(*) AS captures, min(crawl) AS first_crawl, max(crawl) AS last_crawl
+        FROM host_pages(host) WHERE subset = 'warc' GROUP BY url ORDER BY url;
+
+    -- Redirects of a domain, for example to a new domain. fetch_redirect is in the index since CC-MAIN-2019-47.
+    CREATE MACRO domain_redirects(domain) AS TABLE
+        SELECT crawl, url, fetch_status, fetch_redirect
+        FROM domain_pages(domain) WHERE subset = 'crawldiagnostics' AND fetch_redirect IS NOT NULL
+        ORDER BY crawl, url;
+
+    -- robots.txt fetches of a domain, read them with warc_record()
+    CREATE MACRO domain_robots_txt(domain) AS TABLE
+        SELECT crawl, url, fetch_status, warc_filename, warc_record_offset, warc_record_length
+        FROM domain_pages(domain) WHERE subset = 'robotstxt' ORDER BY crawl, url;
+
+    -- Registered domains of a top level domain in one crawl
+    CREATE MACRO tld_domains(tld, crawl_id) AS TABLE
+        SELECT url_host_registered_domain AS domain, count(*) AS pages, count(DISTINCT url_host_name) AS hosts
+        FROM archives WHERE crawl = crawl_id AND subset = 'warc' AND url_host_tld = tld
+        GROUP BY ALL ORDER BY pages DESC;
 """
 
 
@@ -171,6 +239,28 @@ def freeze(catalog_path, frozen_path):
 
     con.execute(f"ATTACH 'ducklake:{frozen_path}' AS frozen; USE frozen;")
     con.execute(SURT_MACROS)
+    # Crawls with their names and fetch times from index.commoncrawl.org/collinfo.json, as a constant table which
+    # doesn't scan anything. The lambda passes them to cdx_captures() of the extract extension so that fetch_time
+    # filters skip the other crawls. The parquet statistics can't be used for this: crawls before CC-MAIN-2017-43 have
+    # none and some crawls have a few records with a fetch_time years before the crawl.
+    if not os.path.exists(COLLINFO_PATH):
+        urllib.request.urlretrieve(COLLINFO_URL, COLLINFO_PATH)
+    rows, missing = con.execute("""
+        WITH catalog AS (
+            SELECT DISTINCT regexp_extract(data_file, 'crawl=([^/]+)/', 1) AS crawl
+            FROM ducklake_list_files('frozen', 'archives')
+        ), info AS (
+            SELECT id AS crawl, name, "from"::TIMESTAMP AS first_fetch, "to"::TIMESTAMP AS last_fetch
+            FROM read_json($path)
+        )
+        SELECT string_agg(format('(''{}'', ''{}'', ''{}''::TIMESTAMP, ''{}''::TIMESTAMP)', crawl, replace(name, chr(39), chr(39) || chr(39)),
+                first_fetch, last_fetch), ', ' ORDER BY crawl) FILTER (info.crawl IS NOT NULL),
+            list(crawl) FILTER (info.crawl IS NULL)
+        FROM catalog LEFT JOIN info USING (crawl)
+    """, {"path": COLLINFO_PATH}).fetchall()[0]
+    if missing:
+        raise SystemExit(f"{COLLINFO_PATH} doesn't have {missing}, download a new one from {COLLINFO_URL}")
+    con.execute(f"CREATE MACRO crawls() AS TABLE SELECT * FROM (VALUES {rows}) AS t(crawl, name, first_fetch, last_fetch)")
     con.close()
     print(f"Frozen catalog is {os.path.getsize(frozen_path) / 1e6:.0f}MB")
 
