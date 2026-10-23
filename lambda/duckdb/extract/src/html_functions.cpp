@@ -28,6 +28,7 @@
 
 #include <lexbor/css/css.h>
 #include <lexbor/html/html.h>
+#include <lexbor/html/tree/open_elements.h>
 #include <lexbor/selectors/selectors.h>
 
 namespace duckdb {
@@ -168,6 +169,48 @@ public:
 		if (status != LXB_STATUS_OK && status != LXB_STATUS_STOP) {
 			throw InvalidInputException("failed to match CSS selector \"%s\"", spec.css);
 		}
+	}
+
+	//! Incremental parsing: the document grows with every chunk and can be queried in between
+	void BeginChunks() {
+		lxb_html_document_clean(document);
+		if (lxb_html_document_parse_chunk_begin(document) != LXB_STATUS_OK) {
+			throw InvalidInputException("failed to parse HTML");
+		}
+	}
+
+	void ParseChunk(const char *data, idx_t size) {
+		if (lxb_html_document_parse_chunk(document, const_data_ptr_cast(data), size) != LXB_STATUS_OK) {
+			throw InvalidInputException("failed to parse HTML");
+		}
+	}
+
+	void EndChunks() {
+		lxb_html_document_parse_chunk_end(document);
+	}
+
+	//! Whether the first match of the selector exists and its element is closed, so that more HTML can't change it
+	bool FirstMatchIsFinal(const SelectorSpec &spec) {
+		auto list = Compile(spec.css);
+		lxb_dom_node_t *first = nullptr;
+		auto callback = [](lxb_dom_node_t *node, lxb_css_selector_specificity_t, void *ctx) -> lxb_status_t {
+			*static_cast<lxb_dom_node_t **>(ctx) = node;
+			return LXB_STATUS_STOP;
+		};
+		auto status = lxb_selectors_find(selectors, lxb_dom_interface_node(document), list, callback, &first);
+		if ((status != LXB_STATUS_OK && status != LXB_STATUS_STOP) || !first) {
+			return false;
+		}
+		if (spec.mode == SelectMode::ATTRIBUTE) {
+			// Attributes are complete with the start tag
+			return true;
+		}
+		auto parser = static_cast<lxb_html_parser_t *>(lxb_dom_interface_document(document)->parser);
+		if (!parser || !parser->tree) {
+			return false;
+		}
+		size_t index = 0;
+		return !lxb_html_tree_open_elements_find_by_node(parser->tree, first, &index);
 	}
 
 	string Text() {
@@ -333,6 +376,49 @@ private:
 		}
 	}
 };
+
+} // namespace
+
+struct HtmlStreamMatcher::State {
+	HtmlDocument document;
+	vector<SelectorSpec> pending;
+};
+
+unique_ptr<HtmlStreamMatcher> HtmlStreamMatcher::Create(const vector<string> &selectors) {
+	auto matcher = unique_ptr<HtmlStreamMatcher>(new HtmlStreamMatcher());
+	matcher->state = make_uniq<State>();
+	for (auto &selector : selectors) {
+		auto spec = ParseSelectorSpec(selector);
+		// These look at elements after the match, a closed match isn't final for them
+		auto css = StringUtil::Lower(spec.css);
+		for (auto forward : {":has(", ":last", ":only", ":nth-last", ":empty"}) {
+			if (css.find(forward) != string::npos) {
+				return nullptr;
+			}
+		}
+		matcher->state->pending.push_back(std::move(spec));
+	}
+	matcher->state->document.BeginChunks();
+	return matcher;
+}
+
+HtmlStreamMatcher::HtmlStreamMatcher() = default;
+HtmlStreamMatcher::~HtmlStreamMatcher() = default;
+
+bool HtmlStreamMatcher::Feed(const char *data, idx_t size) {
+	auto &state = *this->state;
+	state.document.ParseChunk(data, size);
+	for (idx_t i = 0; i < state.pending.size();) {
+		if (state.document.FirstMatchIsFinal(state.pending[i])) {
+			state.pending.erase(state.pending.begin() + i);
+		} else {
+			i++;
+		}
+	}
+	return state.pending.empty();
+}
+
+namespace {
 
 Value ToListValue(vector<string> &values) {
 	vector<Value> list;

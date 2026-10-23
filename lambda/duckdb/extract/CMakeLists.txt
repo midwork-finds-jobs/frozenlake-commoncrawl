@@ -34,9 +34,13 @@ FetchContent_Declare(
 FetchContent_MakeAvailable(libdeflate)
 
 include_directories(src/include)
-set(EXTENSION_SOURCES src/extract_extension.cpp src/warc_record.cpp src/html_functions.cpp src/macros.cpp src/charset.cpp src/memory_governor.cpp src/optimizer.cpp src/url_functions.cpp src/cdx.cpp src/fast_scan.cpp)
+set(EXTENSION_SOURCES src/extract_extension.cpp src/warc_record.cpp src/html_functions.cpp src/macros.cpp src/charset.cpp src/memory_governor.cpp src/optimizer.cpp src/url_functions.cpp src/cdx.cpp src/fast_scan.cpp src/async_fetch.cpp)
 build_static_extension(${TARGET_NAME} ${EXTENSION_SOURCES})
 build_loadable_extension(${TARGET_NAME} " " ${EXTENSION_SOURCES})
-target_link_libraries(${EXTENSION_NAME} lexbor_static libdeflate_static)
-target_link_libraries(${LOADABLE_EXTENSION_NAME} lexbor_static libdeflate_static)
+# curl, OpenSSL and zlib come from the vcpkg dependencies of httpfs
+find_package(CURL REQUIRED)
+find_package(OpenSSL REQUIRED)
+find_package(ZLIB REQUIRED)
+target_link_libraries(${EXTENSION_NAME} lexbor_static libdeflate_static CURL::libcurl OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
+target_link_libraries(${LOADABLE_EXTENSION_NAME} lexbor_static libdeflate_static CURL::libcurl OpenSSL::SSL OpenSSL::Crypto ZLIB::ZLIB)
 
