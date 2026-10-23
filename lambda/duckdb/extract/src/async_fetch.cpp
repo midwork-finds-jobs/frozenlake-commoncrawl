@@ -173,8 +173,8 @@ public:
 	}
 
 	static constexpr idx_t MAX_ATTEMPTS = 5;
-	static constexpr idx_t BASE_BACKOFF_MS = 100;
-	static constexpr idx_t MAX_BACKOFF_MS = 3000;
+	static constexpr idx_t BASE_BACKOFF_MS = 1000;
+	static constexpr idx_t MAX_BACKOFF_MS = 10000;
 	//! Throttling never lowers the concurrency below this
 	static constexpr double MIN_ALLOWED = 8;
 
@@ -358,10 +358,12 @@ private:
 				std::lock_guard<std::mutex> guard(last_retry_lock);
 				last_retry = error;
 			}
-			// Exponential backoff with full jitter like the AWS SDKs. Without jitter the requests which S3 throttled
-			// together were retried together and throttled again.
-			auto cap = MinValue<idx_t>(MAX_BACKOFF_MS, BASE_BACKOFF_MS << request->attempts);
-			request->retry_at = Clock::now() + std::chrono::milliseconds(std::uniform_int_distribution<idx_t>(0, cap)(random));
+			// Common Crawl asks to wait at least 1s after a 503 and to back off to 10s: 1s, 2s, 4s, 8s, 10s plus up to
+			// half of it as jitter. Without jitter the requests which S3 throttled together were retried together and
+			// throttled again.
+			auto backoff = MinValue<idx_t>(MAX_BACKOFF_MS, BASE_BACKOFF_MS << (request->attempts - 1));
+			auto jitter = std::uniform_int_distribution<idx_t>(0, backoff / 2)(random);
+			request->retry_at = Clock::now() + std::chrono::milliseconds(backoff + jitter);
 			retrying.push_back(request);
 			return;
 		}
