@@ -190,8 +190,9 @@ public:
 	}
 
 	//! Whether the first match of the selector exists and its element is closed, so that more HTML can't change it
-	//! Whether the first match which Select() would return can't change anymore when more of the page is parsed
-	bool FirstMatchIsFinal(const SelectorSpec &spec) {
+	//! Whether the first match which Select() would return can't change anymore when more of the page is parsed,
+	//! and its value then
+	bool FirstMatchIsFinal(const SelectorSpec &spec, string &value) {
 		auto parser = static_cast<lxb_html_parser_t *>(lxb_dom_interface_document(document)->parser);
 		if (!parser || !parser->tree) {
 			return false;
@@ -200,8 +201,9 @@ public:
 		struct Context {
 			const SelectorSpec *spec;
 			lxb_html_tree_t *tree;
+			string *value;
 			bool final;
-		} context {&spec, parser->tree, false};
+		} context {&spec, parser->tree, &value, false};
 		auto callback = [](lxb_dom_node_t *node, lxb_css_selector_specificity_t, void *ctx) -> lxb_status_t {
 			auto &context = *static_cast<Context *>(ctx);
 			try {
@@ -214,14 +216,14 @@ public:
 						return LXB_STATUS_STOP;
 					}
 					// Attributes are complete with the start tag, Select() skips elements without the attribute
-					string value;
-					if (!Render(node, *context.spec, value)) {
+					if (!Render(node, *context.spec, *context.value)) {
 						return LXB_STATUS_OK;
 					}
 					context.final = true;
 					return LXB_STATUS_STOP;
 				}
-				context.final = !IsOpen(context.tree, node);
+				// Render() of the other modes only fails when serializing fails, Select() would skip the node then
+				context.final = !IsOpen(context.tree, node) && Render(node, *context.spec, *context.value);
 			} catch (...) {
 				context.final = false;
 			}
@@ -441,6 +443,9 @@ private:
 struct HtmlStreamMatcher::State {
 	HtmlDocument document;
 	vector<SelectorSpec> pending;
+	//! The selectors as given, in the order of pending
+	vector<string> pending_selectors;
+	vector<pair<string, string>> matches;
 };
 
 bool HtmlStreamMatcher::Supports(const vector<string> &selectors) {
@@ -468,6 +473,7 @@ unique_ptr<HtmlStreamMatcher> HtmlStreamMatcher::Create(const vector<string> &se
 	matcher->state = make_uniq<State>();
 	for (auto &selector : selectors) {
 		matcher->state->pending.push_back(ParseSelectorSpec(selector));
+		matcher->state->pending_selectors.push_back(selector);
 	}
 	matcher->state->document.BeginChunks();
 	return matcher;
@@ -479,14 +485,21 @@ HtmlStreamMatcher::~HtmlStreamMatcher() = default;
 bool HtmlStreamMatcher::Feed(const char *data, idx_t size) {
 	auto &state = *this->state;
 	state.document.ParseChunk(data, size);
+	string value;
 	for (idx_t i = 0; i < state.pending.size();) {
-		if (state.document.FirstMatchIsFinal(state.pending[i])) {
+		if (state.document.FirstMatchIsFinal(state.pending[i], value)) {
+			state.matches.emplace_back(std::move(state.pending_selectors[i]), std::move(value));
 			state.pending.erase(state.pending.begin() + i);
+			state.pending_selectors.erase(state.pending_selectors.begin() + i);
 		} else {
 			i++;
 		}
 	}
 	return state.pending.empty();
+}
+
+const vector<pair<string, string>> &HtmlStreamMatcher::Matches() const {
+	return state->matches;
 }
 
 namespace {
@@ -610,20 +623,25 @@ void HtmlExtractFunction(DataChunk &args, ExpressionState &state, Vector &result
 //! html_query(html, kinds, selectors): the html_* calls of one query on the same HTML combined so that every
 //! document is parsed only once, see optimizer.cpp. Kind is 'all' (html_select), 'first' (html_select_first) or
 //! 'text' (html_text). The result is a struct with fields m0, m1, ... in the same order.
+//!
+//! html_query(html, kinds, selectors, first_matches) takes the first matches which warc_fetch() found while it
+//! streamed the record, record.first_matches, and parses the HTML only when one of the selectors isn't in them.
 struct HtmlQueryData : public FunctionData {
 	vector<string> kinds;
 	vector<SelectorSpec> specs;
+	vector<string> selectors;
 
 	unique_ptr<FunctionData> Copy() const override {
 		auto copy = make_uniq<HtmlQueryData>();
 		copy->kinds = kinds;
 		copy->specs = specs;
+		copy->selectors = selectors;
 		return std::move(copy);
 	}
 
 	bool Equals(const FunctionData &other_p) const override {
 		auto &other = other_p.Cast<HtmlQueryData>();
-		if (kinds != other.kinds || specs.size() != other.specs.size()) {
+		if (kinds != other.kinds || selectors != other.selectors || specs.size() != other.specs.size()) {
 			return false;
 		}
 		for (idx_t i = 0; i < specs.size(); i++) {
@@ -663,11 +681,37 @@ unique_ptr<FunctionData> HtmlQueryBind(BindScalarFunctionInput &input) {
 			throw BinderException("unknown html_query kind \"%s\"", kind);
 		}
 		data->specs.push_back(ParseSelectorSpec(selectors[i]));
+		data->selectors.push_back(selectors[i]);
 		children.emplace_back("m" + to_string(i),
 		                      kind == "all" ? LogicalType::LIST(LogicalType::VARCHAR) : LogicalType::VARCHAR);
 	}
 	input.GetBoundFunction().SetReturnType(LogicalType::STRUCT(children));
 	return std::move(data);
+}
+
+//! Points found at the value of every selector in record.first_matches, false when one isn't there
+bool FindFirstMatches(const Value &first_matches, const HtmlQueryData &data, vector<const string *> &found) {
+	if (first_matches.IsNull()) {
+		return false;
+	}
+	auto &entries = ListValue::GetChildren(first_matches);
+	for (idx_t m = 0; m < data.kinds.size(); m++) {
+		found[m] = nullptr;
+		if (data.kinds[m] != "first") {
+			return false;
+		}
+		for (auto &entry : entries) {
+			auto &key_value = StructValue::GetChildren(entry);
+			if (!key_value[1].IsNull() && StringValue::Get(key_value[0]) == data.selectors[m]) {
+				found[m] = &StringValue::Get(key_value[1]);
+				break;
+			}
+		}
+		if (!found[m]) {
+			return false;
+		}
+	}
+	return true;
 }
 
 void HtmlQueryFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -681,6 +725,8 @@ void HtmlQueryFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 	auto &outputs = StructVector::GetEntries(result);
 	HtmlDocument document;
 	vector<string> matches;
+	bool has_first_matches = args.ColumnCount() == 4;
+	vector<const string *> found(data.kinds.size());
 	for (idx_t i = 0; i < count; i++) {
 		auto hi = htmls.sel->get_index(i);
 		if (!htmls.validity.RowIsValid(hi)) {
@@ -689,6 +735,15 @@ void HtmlQueryFunction(DataChunk &args, ExpressionState &state, Vector &result) 
 				FlatVector::SetNull(output, i, true);
 			}
 			continue;
+		}
+		if (has_first_matches) {
+			auto first_matches = args.data[3].GetValue(i);
+			if (FindFirstMatches(first_matches, data, found)) {
+				for (idx_t m = 0; m < found.size(); m++) {
+					FlatVector::GetDataMutable<string_t>(outputs[m])[i] = StringVector::AddString(outputs[m], *found[m]);
+				}
+				continue;
+			}
 		}
 		document.Parse(html_data[hi]);
 		for (idx_t m = 0; m < data.kinds.size(); m++) {
@@ -817,14 +872,20 @@ void RegisterHtmlFunctions(ExtensionLoader &loader) {
 	ScalarFunction html_extract("html_extract", {LogicalType::VARCHAR, LogicalType::ANY}, LogicalType::ANY,
 	                            HtmlExtractFunction, HtmlExtractBind);
 	ScalarFunction html_text("html_text", {LogicalType::VARCHAR}, LogicalType::VARCHAR, HtmlTextFunction);
-	ScalarFunction html_query("html_query",
-	                          {LogicalType::VARCHAR, LogicalType::LIST(LogicalType::VARCHAR),
-	                           LogicalType::LIST(LogicalType::VARCHAR)},
-	                          LogicalType::ANY, HtmlQueryFunction, HtmlQueryBind);
-	for (auto function : {&html_select, &html_select_first, &html_extract, &html_text, &html_query}) {
+	ScalarFunctionSet html_query("html_query");
+	auto strings = LogicalType::LIST(LogicalType::VARCHAR);
+	for (auto arguments : {vector<LogicalType> {LogicalType::VARCHAR, strings, strings},
+	                       vector<LogicalType> {LogicalType::VARCHAR, strings, strings,
+	                                            LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR)}}) {
+		ScalarFunction function("html_query", arguments, LogicalType::ANY, HtmlQueryFunction, HtmlQueryBind);
+		function.SetFallible();
+		html_query.AddFunction(function);
+	}
+	for (auto function : {&html_select, &html_select_first, &html_extract, &html_text}) {
 		function->SetFallible();
 		loader.RegisterFunction(*function);
 	}
+	loader.RegisterFunction(html_query);
 	loader.RegisterFunction(ScalarFunction("js_object", {LogicalType::VARCHAR, LogicalType::VARCHAR},
 	                                       LogicalType::VARCHAR, JsObjectFunction));
 }

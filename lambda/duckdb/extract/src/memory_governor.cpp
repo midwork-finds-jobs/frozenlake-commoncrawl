@@ -226,6 +226,34 @@ FetchBudget::~FetchBudget() {
 	budget_released.notify_all();
 }
 
+unique_ptr<FetchMemory> FetchMemory::TryReserve(idx_t needed, bool force) {
+#ifdef EXTRACT_MEMORY_GOVERNOR
+	auto target = target_bytes.load();
+	if (target == 0) {
+		return unique_ptr<FetchMemory>(new FetchMemory(0));
+	}
+	auto limit = target - Headroom(target) / 2;
+	while (true) {
+		auto used = MaxValue<idx_t>(last_resident.load(), last_cgroup.load());
+		auto current = reserved.load();
+		if (!force && used + current + needed > limit) {
+			return nullptr;
+		}
+		if (reserved.compare_exchange_weak(current, current + needed)) {
+			return unique_ptr<FetchMemory>(new FetchMemory(needed));
+		}
+	}
+#else
+	return unique_ptr<FetchMemory>(new FetchMemory(0));
+#endif
+}
+
+FetchMemory::~FetchMemory() {
+	if (bytes > 0) {
+		reserved -= bytes;
+	}
+}
+
 MemoryReservation::~MemoryReservation() {
 	if (bytes > 0) {
 		reserved -= bytes;

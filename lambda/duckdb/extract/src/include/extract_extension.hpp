@@ -29,6 +29,23 @@ private:
 	idx_t bytes = 0;
 };
 
+//! Memory reserved for a record while it's being fetched, released once its bytes arrived and the governor sees
+//! them. Fetches are asynchronous, so instead of waiting like MemoryReservation the caller stops submitting.
+class FetchMemory {
+public:
+	//! nullptr when the process would go over memory_target_mb. `force` always reserves, callers pass it when
+	//! nothing of theirs is in flight so that a query can't wait for itself.
+	static unique_ptr<FetchMemory> TryReserve(idx_t bytes, bool force);
+	~FetchMemory();
+	FetchMemory(const FetchMemory &) = delete;
+	FetchMemory &operator=(const FetchMemory &) = delete;
+
+private:
+	explicit FetchMemory(idx_t bytes) : bytes(bytes) {
+	}
+	idx_t bytes;
+};
+
 //! Bytes which the warc_record() calls of all threads may fetch at the same time, about half of memory_target_mb.
 //! One vector of large pages takes hundreds of megabytes, so a call waits while earlier calls hold the budget. A call
 //! is always let through when nothing else holds it, so this can't deadlock.
@@ -117,6 +134,8 @@ public:
 	~HtmlStreamMatcher();
 	//! Parses the next part of the body, true once every selector has its final first match
 	bool Feed(const char *data, idx_t size);
+	//! The value of the final first match of the selectors which have one, by selector as given to Create()
+	const vector<pair<string, string>> &Matches() const;
 
 private:
 	HtmlStreamMatcher();

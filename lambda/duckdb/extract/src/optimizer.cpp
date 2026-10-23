@@ -165,11 +165,35 @@ Value StringList(const vector<string> &strings) {
 	return Value::LIST(LogicalType::VARCHAR, std::move(values));
 }
 
-unique_ptr<Expression> StructExtract(FunctionBinder &binder, const Expression &query, idx_t member) {
+unique_ptr<Expression> StructField(FunctionBinder &binder, const Expression &value, const string &field) {
 	vector<unique_ptr<Expression>> children;
-	children.push_back(query.Copy());
-	children.push_back(make_uniq<BoundConstantExpression>(Value("m" + to_string(member))));
+	children.push_back(value.Copy());
+	children.push_back(make_uniq<BoundConstantExpression>(Value(field)));
 	return binder.BindScalarFunction(DEFAULT_SCHEMA, "struct_extract", std::move(children));
+}
+
+unique_ptr<Expression> StructExtract(FunctionBinder &binder, const Expression &query, idx_t member) {
+	return StructField(binder, query, "m" + to_string(member));
+}
+
+//! The call's value from the members of an html_query() starting at `offset`
+unique_ptr<Expression> CallReplacement(FunctionBinder &binder, const HtmlCall &call, const Expression &query,
+                                       idx_t offset) {
+	if (!call.is_extract) {
+		return StructExtract(binder, query, offset);
+	}
+	vector<unique_ptr<Expression>> fields;
+	for (idx_t f = 0; f < call.fields.size(); f++) {
+		auto field = StructExtract(binder, query, offset + f);
+		field->SetAlias(Identifier(call.fields[f]));
+		fields.push_back(std::move(field));
+	}
+	auto pack = binder.BindScalarFunction(DEFAULT_SCHEMA, "struct_pack", std::move(fields));
+	// html_extract() of NULL is NULL, not a struct of NULLs
+	auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
+	is_null->GetChildrenMutable().push_back(query.Copy());
+	auto null_struct = make_uniq<BoundConstantExpression>(Value(pack->GetReturnType()));
+	return make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_struct), std::move(pack));
 }
 
 void CombineCalls(ClientContext &context, vector<unique_ptr<Expression>> &expressions) {
@@ -226,24 +250,7 @@ void CombineCalls(ClientContext &context, vector<unique_ptr<Expression>> &expres
 			auto &call = calls[group[g]];
 			auto &slot = *call.slot;
 			auto alias = slot->GetAlias();
-			unique_ptr<Expression> replacement;
-			if (call.is_extract) {
-				vector<unique_ptr<Expression>> fields;
-				for (idx_t f = 0; f < call.fields.size(); f++) {
-					auto field = StructExtract(binder, *query, offsets[g] + f);
-					field->SetAlias(Identifier(call.fields[f]));
-					fields.push_back(std::move(field));
-				}
-				auto pack = binder.BindScalarFunction(DEFAULT_SCHEMA, "struct_pack", std::move(fields));
-				// html_extract() of NULL is NULL, not a struct of NULLs
-				auto is_null = make_uniq<BoundOperatorExpression>(ExpressionType::OPERATOR_IS_NULL, LogicalType::BOOLEAN);
-				is_null->GetChildrenMutable().push_back(query->Copy());
-				auto null_struct = make_uniq<BoundConstantExpression>(Value(pack->GetReturnType()));
-				replacement =
-				    make_uniq<BoundCaseExpression>(std::move(is_null), std::move(null_struct), std::move(pack));
-			} else {
-				replacement = StructExtract(binder, *query, offsets[g]);
-			}
+			auto replacement = CallReplacement(binder, call, *query, offsets[g]);
 			replacement->SetAlias(alias);
 			slot = std::move(replacement);
 		}
@@ -273,6 +280,9 @@ public:
 			// Selectors which can't be streamed would only add a second request for the rest of every record
 			if (!fetch.poisoned && !fetch.selectors.empty() && HtmlStreamMatcher::Supports(fetch.selectors)) {
 				SetWarcFetchStreamSelectors(*fetch.get->bind_data, fetch.selectors);
+				for (auto slot : fetch.calls) {
+					UseFirstMatches(*slot);
+				}
 			}
 		}
 	}
@@ -281,8 +291,40 @@ private:
 	struct Fetch {
 		LogicalGet *get;
 		vector<string> selectors;
+		//! The html_* calls on the body
+		vector<unique_ptr<Expression> *> calls;
 		bool poisoned = false;
 	};
+
+	//! html_query(body, kinds, selectors, record.first_matches) instead of the call, which takes the values that
+	//! warc_fetch() found while streaming instead of parsing the body again
+	void UseFirstMatches(unique_ptr<Expression> &slot) {
+		FunctionBinder binder(context);
+		auto &children = slot->Cast<BoundFunctionExpression>().GetChildren();
+		auto &body = *children[0];
+		auto &record = *body.Cast<BoundFunctionExpression>().GetChildren()[0];
+		vector<unique_ptr<Expression>> query_children;
+		query_children.push_back(body.Copy());
+		unique_ptr<Expression> replacement;
+		HtmlCall call;
+		if (FunctionName(*slot) == "html_query") {
+			for (idx_t i = 1; i < children.size(); i++) {
+				query_children.push_back(children[i]->Copy());
+			}
+			query_children.push_back(StructField(binder, record, "first_matches"));
+			replacement = binder.BindScalarFunction(DEFAULT_SCHEMA, "html_query", std::move(query_children));
+		} else if (ParseCall(context, slot, call)) {
+			query_children.push_back(make_uniq<BoundConstantExpression>(StringList(call.kinds)));
+			query_children.push_back(make_uniq<BoundConstantExpression>(StringList(call.selectors)));
+			query_children.push_back(StructField(binder, record, "first_matches"));
+			auto query = binder.BindScalarFunction(DEFAULT_SCHEMA, "html_query", std::move(query_children));
+			replacement = CallReplacement(binder, call, *query, 0);
+		} else {
+			return;
+		}
+		replacement->SetAlias(slot->GetAlias());
+		slot = std::move(replacement);
+	}
 	ClientContext &context;
 	vector<Fetch> fetches;
 	//! Bindings of a record column and the index of its warc_fetch() in fetches
@@ -371,6 +413,7 @@ private:
 				if (!first_only) {
 					entry.poisoned = true;
 				}
+				entry.calls.push_back(&expression);
 				for (auto &selector : selectors) {
 					if (std::find(entry.selectors.begin(), entry.selectors.end(), selector) == entry.selectors.end()) {
 						entry.selectors.push_back(selector);
@@ -408,7 +451,7 @@ private:
 				PoisonOutput(*op.children[0]);
 			}
 			if (IsWarcFetch(get.function.GetName().GetIdentifierName())) {
-				fetches.push_back(Fetch {&get, {}, false});
+				fetches.push_back(Fetch {&get, {}, {}, false});
 				auto bindings = get.GetColumnBindings();
 				auto &column_ids = get.GetColumnIds();
 				for (idx_t i = 0; i < column_ids.size() && i < bindings.size(); i++) {

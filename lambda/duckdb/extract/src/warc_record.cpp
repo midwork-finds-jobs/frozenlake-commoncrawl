@@ -109,6 +109,8 @@ struct FetchedRecord {
 	string error;
 	//! warc_fetch() read only the beginning of the record because it had the first matches the query needs
 	bool truncated = false;
+	//! Those matches by selector, so that the html_* functions don't parse the body again
+	vector<pair<string, string>> first_matches;
 };
 
 //! Threads shared by every warc_record() call so that parallel DuckDB tasks don't multiply the thread count
@@ -617,6 +619,15 @@ public:
 		}
 	}
 
+	//! The first matches the stream found, by selector
+	vector<pair<string, string>> Matches() const {
+		return matcher ? matcher->Matches() : vector<pair<string, string>>();
+	}
+	//! Offset of the HTML body in out, which the matches were found in
+	idx_t BodyStart() const {
+		return body_start;
+	}
+
 	string out;
 	bool failed = false;
 	bool finished = false;
@@ -682,6 +693,11 @@ struct FetchSlot {
 	bool truncated = false;
 	string data;
 	string error;
+	//! Values of the first matches the streaming found in the body which starts at matches_body_start of data
+	vector<pair<string, string>> matches;
+	idx_t matches_body_start = 0;
+	//! Released when the data arrived, the governor sees the memory then
+	unique_ptr<FetchMemory> memory;
 };
 
 struct FetchWaiter {
@@ -699,6 +715,11 @@ void WaitForFetches(ClientContext &context, FetchWaiter &waiter, F done) {
 			throw InterruptException();
 		}
 	}
+}
+
+//! Memory of a record until it's in a result vector: compressed, inflated and decoded about 8 times its size
+idx_t RecordMemory(const FetchJob &job) {
+	return NumericCast<idx_t>(MaxValue<int64_t>(job.length, 0)) * 8;
 }
 
 bool IsRemote(const string &path) {
@@ -719,9 +740,18 @@ void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelect
 			slot->error = std::move(error);
 			slot->decompressed = decompressed;
 			slot->truncated = truncated;
+			slot->memory.reset();
 			slot->done = true;
 		}
 		waiter->finished.notify_all();
+	};
+	auto finish_matched = [waiter, slot, finish](string data, vector<pair<string, string>> matches, idx_t body_start) {
+		{
+			std::lock_guard<std::mutex> guard(waiter->lock);
+			slot->matches = std::move(matches);
+			slot->matches_body_start = body_start;
+		}
+		finish(std::move(data), string(), true, true);
 	};
 	try {
 		if (job.offset < 0 || job.length <= 0 || job.offset > NumericLimits<int64_t>::Maximum() - job.length) {
@@ -766,20 +796,20 @@ void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelect
 			auto rest = make_shared_ptr<AsyncRequest>(MakeRangeRequest(
 			    job.path, job.offset + STREAM_FIRST_BYTES, job.length - STREAM_FIRST_BYTES, credentials));
 			rest->hedge_ms = hedge_ms;
-			first.on_done = [stream_selectors, rest, finish](string head, string error) {
+			first.on_done = [stream_selectors, rest, finish, finish_matched](string head, string error) {
 				if (!error.empty()) {
 					finish(string(), std::move(error), false, false);
 					return;
 				}
 				// Parsing doesn't belong on the fetcher thread
 				auto data = make_shared_ptr<string>(std::move(head));
-				FetchPool::Get().Submit([stream_selectors, rest, finish, data]() {
+				FetchPool::Get().Submit([stream_selectors, rest, finish, finish_matched, data]() {
 					try {
 						StreamingRecord record(stream_selectors);
 						auto more = record.Feed(data->data(), data->size());
 						if (!more && !record.failed) {
 							// The CRC32 is in the trailer at the end of the record, it can't be checked without the rest
-							finish(std::move(record.out), string(), true, true);
+							finish_matched(std::move(record.out), record.Matches(), record.BodyStart());
 							return;
 						}
 						rest->on_done = [finish, data](string tail, string error) {
@@ -823,6 +853,13 @@ void DecodeSlot(const FetchJob &job, FetchSlot &slot, FetchedRecord &record) {
 		string().swap(slot.data);
 		ParseWarc(raw, job.charset_hint, record);
 		record.truncated = slot.truncated;
+		// The matches are values of the raw bytes, they are the values of the body only when decoding it to UTF-8
+		// didn't change it. That's most pages, the html_* functions parse the others.
+		if (!slot.matches.empty() && raw.size() >= record.body.size() &&
+		    raw.size() - record.body.size() == slot.matches_body_start &&
+		    raw.compare(slot.matches_body_start, record.body.size(), record.body) == 0) {
+			record.first_matches = std::move(slot.matches);
+		}
 		record.fetched = true;
 	} catch (std::exception &ex) {
 		record.fetched = false;
@@ -851,11 +888,17 @@ void WriteRecord(Vector &result, idx_t i, FetchedRecord *record) {
 		children[4].SetValue(i, HeadersToMap(record->warc_headers));
 		FlatVector::SetNull(children[5], i, true);
 		FlatVector::GetDataMutable<bool>(children[6])[i] = record->truncated;
+		if (record->first_matches.empty()) {
+			FlatVector::SetNull(children[7], i, true);
+		} else {
+			children[7].SetValue(i, HeadersToMap(record->first_matches));
+		}
 	} else {
 		for (idx_t c = 0; c < 5; c++) {
 			FlatVector::SetNull(children[c], i, true);
 		}
 		FlatVector::SetNull(children[6], i, true);
+		FlatVector::SetNull(children[7], i, true);
 		FlatVector::GetDataMutable<string_t>(children[5])[i] =
 		    StringVector::AddString(children[5], MakeValidUtf8(record->error));
 	}
@@ -881,28 +924,41 @@ void FetchIntoStruct(ClientContext &context, UnifiedVectorFormat &files, Unified
 	FetchBudget budget(compressed_bytes * 8);
 	auto waiter = make_shared_ptr<FetchWaiter>();
 	vector<shared_ptr<FetchSlot>> slots(count);
-	for (auto &job : jobs) {
-		slots[job.row] = make_shared_ptr<FetchSlot>();
-		StartFetch(settings, job, nullptr, waiter, slots[job.row]);
-	}
-	WaitForFetches(*settings.context, *waiter, [&]() {
-		for (auto &job : jobs) {
-			if (!slots[job.row]->done) {
-				return false;
-			}
-		}
-		return true;
-	});
 	result.SetVectorType(VectorType::FLAT_VECTOR);
-	idx_t next_job = 0;
 	for (idx_t i = 0; i < count; i++) {
 		if (!valid[i]) {
 			WriteRecord(result, i, nullptr);
-			continue;
 		}
-		FetchedRecord record;
-		DecodeSlot(jobs[next_job++], *slots[i], record);
-		WriteRecord(result, i, &record);
+	}
+	// In waves which fit into the memory target, records are in the result vector before the next wave
+	idx_t next = 0;
+	while (next < jobs.size()) {
+		auto start = next;
+		for (; next < jobs.size(); next++) {
+			auto memory = FetchMemory::TryReserve(RecordMemory(jobs[next]), next == start);
+			if (!memory) {
+				break;
+			}
+			auto &slot = slots[jobs[next].row];
+			slot = make_shared_ptr<FetchSlot>();
+			slot->memory = std::move(memory);
+			StartFetch(settings, jobs[next], nullptr, waiter, slot);
+		}
+		WaitForFetches(*settings.context, *waiter, [&]() {
+			for (idx_t j = start; j < next; j++) {
+				if (!slots[jobs[j].row]->done) {
+					return false;
+				}
+			}
+			return true;
+		});
+		for (idx_t j = start; j < next; j++) {
+			auto row = jobs[j].row;
+			FetchedRecord record;
+			DecodeSlot(jobs[j], *slots[row], record);
+			WriteRecord(result, row, &record);
+			slots[row].reset();
+		}
 	}
 }
 
@@ -968,7 +1024,7 @@ LogicalType WarcRecordType() {
 	child_list_t<LogicalType> children = {{"status", LogicalType::INTEGER},   {"headers", headers},
 	                                      {"body", LogicalType::VARCHAR},     {"charset", LogicalType::VARCHAR},
 	                                      {"warc", headers},                  {"error", LogicalType::VARCHAR},
-	                                      {"truncated", LogicalType::BOOLEAN}};
+	                                      {"truncated", LogicalType::BOOLEAN}, {"first_matches", headers}};
 	return LogicalType::STRUCT(children);
 }
 
@@ -1015,7 +1071,16 @@ unique_ptr<LocalTableFunctionState> WarcFetchInitLocal(ExecutionContext &context
 void FillWindow(WarcFetchLocalState &state, const StreamSelectors &stream_selectors) {
 	while (state.next_submit < state.jobs.size() &&
 	       (state.window_bytes < WARC_FETCH_WINDOW_BYTES || state.next_submit == state.next_emit)) {
-		auto row = state.next_submit++;
+		auto row = state.next_submit;
+		unique_ptr<FetchMemory> memory;
+		if (state.valid[row]) {
+			// Stops filling while the process is close to its memory target, unless nothing is in flight
+			memory = FetchMemory::TryReserve(RecordMemory(state.jobs[row]), state.next_submit == state.next_emit);
+			if (!memory) {
+				return;
+			}
+		}
+		state.next_submit++;
 		auto &slot = state.window->slots[row];
 		slot = make_shared_ptr<FetchSlot>();
 		if (!state.valid[row]) {
@@ -1023,6 +1088,7 @@ void FillWindow(WarcFetchLocalState &state, const StreamSelectors &stream_select
 			slot->done = true;
 			continue;
 		}
+		slot->memory = std::move(memory);
 		state.window_bytes += NumericCast<idx_t>(MaxValue<int64_t>(state.jobs[row].length, 0));
 		StartFetch(*state.settings, state.jobs[row], stream_selectors, state.window, slot);
 	}
@@ -1199,17 +1265,12 @@ void RegisterWarcFunctions(ExtensionLoader &loader) {
 	config.AddExtensionOption("warc_skip_head", "Read WARC records without a HEAD request first",
 	                          LogicalType::BOOLEAN, Value::BOOLEAN(true));
 
-	auto headers = LogicalType::MAP(LogicalType::VARCHAR, LogicalType::VARCHAR);
-	child_list_t<LogicalType> children = {{"status", LogicalType::INTEGER},   {"headers", headers},
-	                                      {"body", LogicalType::VARCHAR},     {"charset", LogicalType::VARCHAR},
-	                                      {"warc", headers},                  {"error", LogicalType::VARCHAR},
-	                                      {"truncated", LogicalType::BOOLEAN}};
 	ScalarFunctionSet warc_record("warc_record");
 	// The optional fourth argument is the charset to use when the page doesn't declare one, e.g. content_charset
 	for (auto arguments : {vector<LogicalType> {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT},
 	                       vector<LogicalType> {LogicalType::VARCHAR, LogicalType::BIGINT, LogicalType::BIGINT,
 	                                            LogicalType::VARCHAR}}) {
-		ScalarFunction function("warc_record", arguments, LogicalType::STRUCT(children), WarcRecordFunction);
+		ScalarFunction function("warc_record", arguments, WarcRecordType(), WarcRecordFunction);
 		// Network reads: don't let the optimizer duplicate or constant fold calls
 		function.SetVolatile();
 		// Problems with single records are in the error field, building the result can still run out of memory
