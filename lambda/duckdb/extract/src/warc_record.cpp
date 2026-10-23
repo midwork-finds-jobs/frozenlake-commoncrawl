@@ -242,6 +242,7 @@ uint32_t ReadLittleEndian32(const_data_ptr_t d) {
 // Gzip member -> bytes with libdeflate, which also checks the CRC32 and size trailer so that a wrong byte range
 // doesn't return garbage. The trailer has the size of the result, so it is decompressed into a buffer of exactly that
 // size in one call.
+//! libdeflate checks the CRC32 and size in the gzip trailer
 string InflateGzipMember(const char *data, idx_t size, idx_t limit) {
 	auto d = const_data_ptr_cast(data);
 	if (size < 18 || d[0] != 0x1f || d[1] != 0x8b || d[2] != 8) {
@@ -760,6 +761,7 @@ void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelect
 					StreamingRecord record(stream_selectors);
 					auto more = record.Feed(data->data(), data->size());
 					if (!more && !record.failed) {
+						// The CRC32 is in the trailer at the end of the record, it can't be checked without the rest
 						finish(std::move(record.out), string(), true, true);
 						return;
 					}
@@ -768,6 +770,7 @@ void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelect
 							finish(string(), std::move(error), false, false);
 							return;
 						}
+						// Inflated with the CRC32 check like a record fetched at once
 						finish(*data + tail, string(), false, false);
 					};
 					SubmitAsyncRequest(std::move(*rest));
