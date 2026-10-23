@@ -190,27 +190,45 @@ public:
 	}
 
 	//! Whether the first match of the selector exists and its element is closed, so that more HTML can't change it
+	//! Whether the first match which Select() would return can't change anymore when more of the page is parsed
 	bool FirstMatchIsFinal(const SelectorSpec &spec) {
-		auto list = Compile(spec.css);
-		lxb_dom_node_t *first = nullptr;
-		auto callback = [](lxb_dom_node_t *node, lxb_css_selector_specificity_t, void *ctx) -> lxb_status_t {
-			*static_cast<lxb_dom_node_t **>(ctx) = node;
-			return LXB_STATUS_STOP;
-		};
-		auto status = lxb_selectors_find(selectors, lxb_dom_interface_node(document), list, callback, &first);
-		if ((status != LXB_STATUS_OK && status != LXB_STATUS_STOP) || !first) {
-			return false;
-		}
-		if (spec.mode == SelectMode::ATTRIBUTE) {
-			// Attributes are complete with the start tag
-			return true;
-		}
 		auto parser = static_cast<lxb_html_parser_t *>(lxb_dom_interface_document(document)->parser);
 		if (!parser || !parser->tree) {
 			return false;
 		}
-		size_t index = 0;
-		return !lxb_html_tree_open_elements_find_by_node(parser->tree, first, &index);
+		auto list = Compile(spec.css);
+		struct Context {
+			const SelectorSpec *spec;
+			lxb_html_tree_t *tree;
+			bool final;
+		} context {&spec, parser->tree, false};
+		auto callback = [](lxb_dom_node_t *node, lxb_css_selector_specificity_t, void *ctx) -> lxb_status_t {
+			auto &context = *static_cast<Context *>(ctx);
+			try {
+				if (CanStillMove(context.tree, node)) {
+					return LXB_STATUS_STOP;
+				}
+				if (context.spec->mode == SelectMode::ATTRIBUTE) {
+					// A later <html> or <body> tag adds its attributes to the existing element
+					if (node->local_name == LXB_TAG_HTML || node->local_name == LXB_TAG_BODY) {
+						return LXB_STATUS_STOP;
+					}
+					// Attributes are complete with the start tag, Select() skips elements without the attribute
+					string value;
+					if (!Render(node, *context.spec, value)) {
+						return LXB_STATUS_OK;
+					}
+					context.final = true;
+					return LXB_STATUS_STOP;
+				}
+				context.final = !IsOpen(context.tree, node);
+			} catch (...) {
+				context.final = false;
+			}
+			return LXB_STATUS_STOP;
+		};
+		auto status = lxb_selectors_find(selectors, lxb_dom_interface_node(document), list, callback, &context);
+		return (status == LXB_STATUS_OK || status == LXB_STATUS_STOP) && context.final;
 	}
 
 	string Text() {
@@ -250,6 +268,47 @@ private:
 		}
 		compiled[css] = list;
 		return list;
+	}
+
+	static bool IsOpen(lxb_html_tree_t *tree, lxb_dom_node_t *node) {
+		size_t index = 0;
+		return lxb_html_tree_open_elements_find_by_node(tree, node, &index);
+	}
+
+	//! Whether the parser can still move content in front of the node or move the node itself: content after an open
+	//! table is inserted before the table (foster parenting) and misnested formatting elements like <b><p></b>
+	//! reparent their content (adoption agency)
+	static bool CanStillMove(lxb_html_tree_t *tree, lxb_dom_node_t *node) {
+		for (auto parent = node->parent; parent; parent = parent->parent) {
+			switch (parent->local_name) {
+			case LXB_TAG_TABLE:
+			case LXB_TAG_TBODY:
+			case LXB_TAG_THEAD:
+			case LXB_TAG_TFOOT:
+			case LXB_TAG_TR:
+			case LXB_TAG_A:
+			case LXB_TAG_B:
+			case LXB_TAG_BIG:
+			case LXB_TAG_CODE:
+			case LXB_TAG_EM:
+			case LXB_TAG_FONT:
+			case LXB_TAG_I:
+			case LXB_TAG_NOBR:
+			case LXB_TAG_S:
+			case LXB_TAG_SMALL:
+			case LXB_TAG_STRIKE:
+			case LXB_TAG_STRONG:
+			case LXB_TAG_TT:
+			case LXB_TAG_U:
+				if (IsOpen(tree, parent)) {
+					return true;
+				}
+				break;
+			default:
+				break;
+			}
+		}
+		return false;
 	}
 
 	static bool Render(lxb_dom_node_t *node, const SelectorSpec &spec, string &value) {
@@ -384,19 +443,31 @@ struct HtmlStreamMatcher::State {
 	vector<SelectorSpec> pending;
 };
 
+bool HtmlStreamMatcher::Supports(const vector<string> &selectors) {
+	for (auto &selector : selectors) {
+		// These look at elements after the match, a closed match isn't final for them
+		auto css = StringUtil::Lower(ParseSelectorSpec(selector).css);
+		// CSS escapes could spell these differently, like p:l\61 st-child
+		if (css.find('\\') != string::npos) {
+			return false;
+		}
+		for (auto forward : {":has(", ":last", ":only", ":nth-last", ":empty"}) {
+			if (css.find(forward) != string::npos) {
+				return false;
+			}
+		}
+	}
+	return true;
+}
+
 unique_ptr<HtmlStreamMatcher> HtmlStreamMatcher::Create(const vector<string> &selectors) {
+	if (!Supports(selectors)) {
+		return nullptr;
+	}
 	auto matcher = unique_ptr<HtmlStreamMatcher>(new HtmlStreamMatcher());
 	matcher->state = make_uniq<State>();
 	for (auto &selector : selectors) {
-		auto spec = ParseSelectorSpec(selector);
-		// These look at elements after the match, a closed match isn't final for them
-		auto css = StringUtil::Lower(spec.css);
-		for (auto forward : {":has(", ":last", ":only", ":nth-last", ":empty"}) {
-			if (css.find(forward) != string::npos) {
-				return nullptr;
-			}
-		}
-		matcher->state->pending.push_back(std::move(spec));
+		matcher->state->pending.push_back(ParseSelectorSpec(selector));
 	}
 	matcher->state->document.BeginChunks();
 	return matcher;

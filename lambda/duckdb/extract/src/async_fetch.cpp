@@ -141,13 +141,28 @@ struct Transfer {
 	curl_slist *headers = nullptr;
 	shared_ptr<Request> request;
 	string data;
+	//! Why WriteCallback() aborted the transfer, such errors aren't retried
+	string failure;
 	char error[CURL_ERROR_SIZE] = {0};
 };
 
 size_t WriteCallback(char *data, size_t size, size_t count, void *pointer) {
 	auto &transfer = *static_cast<Transfer *>(pointer);
-	transfer.data.append(data, size * count);
-	return size * count;
+	auto bytes = size * count;
+	auto length = transfer.request->request.length;
+	// A server which ignores the Range header would send the whole file
+	if (length > 0 && transfer.data.size() + bytes > NumericCast<idx_t>(length)) {
+		transfer.failure = StringUtil::Format("the response is longer than the requested %lld bytes", length);
+		return 0;
+	}
+	try {
+		transfer.data.append(data, bytes);
+	} catch (std::exception &) {
+		// Exceptions must not unwind through curl's C code, returning less than bytes aborts the transfer
+		transfer.failure = "out of memory";
+		return 0;
+	}
+	return bytes;
 }
 
 class Fetcher {
@@ -275,8 +290,23 @@ private:
 	}
 
 	static bool Retryable(CURLcode code, long status) {
-		if (code != CURLE_OK) {
+		switch (code) {
+		case CURLE_OK:
+			break;
+		// Network problems, a bad URL or certificate would fail the same way again
+		case CURLE_COULDNT_RESOLVE_HOST:
+		case CURLE_COULDNT_CONNECT:
+		case CURLE_OPERATION_TIMEDOUT:
+		case CURLE_SEND_ERROR:
+		case CURLE_RECV_ERROR:
+		case CURLE_PARTIAL_FILE:
+		case CURLE_GOT_NOTHING:
+		case CURLE_SSL_CONNECT_ERROR:
+		case CURLE_HTTP2:
+		case CURLE_HTTP2_STREAM:
 			return true;
+		default:
+			return false;
 		}
 		return status == 429 || status == 500 || status == 502 || status == 503 || status == 504;
 	}
@@ -329,6 +359,14 @@ private:
 		long status = 0;
 		curl_easy_getinfo(transfer->easy, CURLINFO_RESPONSE_CODE, &status);
 		RecordPhases(transfer->easy);
+		if (!transfer->failure.empty()) {
+			auto failure = transfer->failure;
+			Remove(transfer);
+			if (request->transfers.empty()) {
+				Finish(request, string(), failure);
+			}
+			return;
+		}
 		if (code == CURLE_OK && (status == 200 || status == 206)) {
 			auto data = std::move(transfer->data);
 			if (request->request.length > 0 &&
@@ -344,13 +382,13 @@ private:
 		}
 		string error = code != CURLE_OK ? StringUtil::Format("%s: %s", curl_easy_strerror(code), transfer->error)
 		                                : StringUtil::Format("HTTP %ld: %s", status, transfer->data.substr(0, 200));
+		if (status == 429 || status == 503) {
+			Throttled();
+		}
 		Remove(transfer);
 		if (!request->transfers.empty()) {
 			// The hedged transfer can still succeed
 			return;
-		}
-		if (status == 429 || status == 503) {
-			Throttled();
 		}
 		if (Retryable(code, status) && ++request->attempts <= MAX_ATTEMPTS) {
 			request_retries++;
@@ -372,19 +410,12 @@ private:
 
 	void Run() {
 		while (true) {
-			{
-				std::lock_guard<std::mutex> guard(lock);
-				while (!queue.empty() && transfers < MinValue<idx_t>(concurrency, idx_t(allowed))) {
-					auto request = std::move(queue.front());
-					queue.pop_front();
-					request->started = Clock::now();
-					running.push_back(request);
-					Start(request);
-				}
-			}
+			// Every transfer counts against the limit, so that retries and hedges don't undo the throttling
+			auto limit = MinValue<idx_t>(concurrency, idx_t(allowed));
 			auto now = Clock::now();
+			auto throttled = idx_t(allowed) < concurrency;
 			for (idx_t i = 0; i < retrying.size();) {
-				if (retrying[i]->retry_at <= now) {
+				if (retrying[i]->retry_at <= now && transfers < limit) {
 					retrying[i]->started = now;
 					Start(retrying[i]);
 					retrying.erase(retrying.begin() + i);
@@ -392,10 +423,25 @@ private:
 					i++;
 				}
 			}
-			// Hedge slow requests, streams can't be duplicated
+			vector<shared_ptr<Request>> starting;
+			{
+				// Started outside of the lock so that Submit() doesn't wait for curl's setup
+				std::lock_guard<std::mutex> guard(lock);
+				while (!queue.empty() && transfers + starting.size() < limit) {
+					starting.push_back(std::move(queue.front()));
+					queue.pop_front();
+				}
+			}
+			for (auto &request : starting) {
+				request->started = now;
+				running.push_back(request);
+				Start(request);
+			}
+			// Hedge slow requests
 			for (auto &request : running) {
 				auto hedge_ms = request->request.hedge_ms;
-				if (!request->finished && !request->hedged && hedge_ms > 0 &&
+				// S3 is slow when it throttles, a second request would only add to it
+				if (transfers < limit && !throttled && !request->finished && !request->hedged && hedge_ms > 0 &&
 				    request->transfers.size() == 1 && now - request->started > std::chrono::milliseconds(hedge_ms)) {
 					request->hedged = true;
 					request_hedges++;

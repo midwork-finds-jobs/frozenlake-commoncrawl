@@ -112,6 +112,8 @@ class HtmlStreamMatcher {
 public:
 	//! nullptr when a selector depends on what comes after its match, like :has() or :last-child
 	static unique_ptr<HtmlStreamMatcher> Create(const vector<string> &selectors);
+	//! Whether Create() would succeed, without parsing anything
+	static bool Supports(const vector<string> &selectors);
 	~HtmlStreamMatcher();
 	//! Parses the next part of the body, true once every selector has its final first match
 	bool Feed(const char *data, idx_t size);

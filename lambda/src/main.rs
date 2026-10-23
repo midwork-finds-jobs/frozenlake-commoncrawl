@@ -39,6 +39,9 @@ const CHUNK_BYTES: usize = 1 << 20;
 /// Larger results are uploaded into S3 because Lambda streams responses over 6MB at only 2MB/s
 const INLINE_BYTES: usize = 5 << 20;
 const PART_BYTES: usize = 16 << 20;
+/// Queries are interrupted this long before the lambda's timeout so that the error and the upload of a large
+/// result still make it back
+const QUERY_DEADLINE_MARGIN_SECONDS: usize = 10;
 const RESULTS_PREFIX: &str = "results/";
 /// zstd level used when the request doesn't have one
 const DEFAULT_ZSTD_LEVEL: i32 = 1;
@@ -241,8 +244,10 @@ fn check_sql(conn: &Connection, sql: &str) -> Result<(), Error> {
     let trimmed = sql.trim_start();
     let mut select = trimmed;
     for keyword in ["EXPLAIN", "ANALYZE"] {
-        if select.len() >= keyword.len()
-            && select[..keyword.len()].eq_ignore_ascii_case(keyword)
+        // get() instead of indexing: slicing in the middle of a multibyte character panics
+        if select
+            .get(..keyword.len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case(keyword))
             && select[keyword.len()..].starts_with(|c: char| c.is_whitespace())
         {
             select = select[keyword.len()..].trim_start();
@@ -445,7 +450,7 @@ fn result_key(params: &QueryParams) -> String {
 async fn query(State(app): State<Arc<App>>, Query(params): Query<QueryParams>) -> Response {
     match app.usage().await {
         Ok(usage) if usage.over_limit() => {
-            return error_response(
+            let mut response = error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
                     "The monthly limit of {:.0} GB-seconds is used ({:.0} GB-seconds since {}). \
@@ -453,6 +458,12 @@ async fn query(State(app): State<Arc<App>>, Query(params): Query<QueryParams>) -
                     usage.limit_gb_seconds, usage.used_gb_seconds, usage.month_start
                 ),
             );
+            // Tells the client not to retry, unlike throttling by Lambda
+            response.headers_mut().insert(
+                header::HeaderName::from_static("x-limit-reached"),
+                header::HeaderValue::from_static("1"),
+            );
+            return response;
         }
         Ok(_) => {}
         // Not knowing the usage doesn't stop the queries, CloudWatch can be briefly unavailable
@@ -466,8 +477,17 @@ async fn query(State(app): State<Arc<App>>, Query(params): Query<QueryParams>) -
     let started = std::time::Instant::now();
     let fetches_before = fetch_stats(&app);
 
+    // Stop the query before CloudFront gives up on the lambda: it would retry the request and pay for it again
+    let interrupt = conn.interrupt_handle();
+    let deadline = std::time::Duration::from_secs(
+        env_number("TIMEOUT_SECONDS", 120).saturating_sub(QUERY_DEADLINE_MARGIN_SECONDS) as u64,
+    );
+    let timer = tokio::spawn(async move {
+        tokio::time::sleep(deadline).await;
+        interrupt.interrupt();
+    });
     let (tx, mut rx) = mpsc::channel(8);
-    tokio::task::spawn_blocking(move || run_query(conn, params, tx));
+    let task = tokio::task::spawn_blocking(move || run_query(conn, params, tx));
 
     let mut inline = Vec::new();
     let mut upload: Option<ResultUpload> = None;
@@ -510,15 +530,38 @@ async fn query(State(app): State<Arc<App>>, Query(params): Query<QueryParams>) -
         }
     }
 
-    // The lake is frozen so results can be cached
-    let cache = (header::CACHE_CONTROL, "public, max-age=86400");
+    timer.abort();
+    // A panic closes the channel like a finished query, it must not look like an empty result
+    if let Err(e) = task.await {
+        if let Some(upload) = upload {
+            upload.abort().await;
+        }
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("The query failed: {e}"),
+        );
+    }
+    let fetches_after = fetch_stats(&app);
+    // The lake is frozen so results can be cached, unless records failed to fetch: those are usually
+    // throttling by S3 and the same query returns them later
+    let failed_fetches = fetches_after
+        .zip(fetches_before)
+        .is_some_and(|(after, before)| after[2] > before[2]);
+    let cache = (
+        header::CACHE_CONTROL,
+        if failed_fetches {
+            "no-store"
+        } else {
+            "public, max-age=86400"
+        },
+    );
     // Time spent in the lambda and warc_record() fetches for the client's statistics
     let duration = started.elapsed().as_millis().to_string();
     let duration = (
         header::HeaderName::from_static("x-duration-ms"),
         duration.as_str(),
     );
-    let fetches = fetch_stats(&app)
+    let fetches = fetches_after
         .zip(fetches_before)
         .map(|(after, before)| {
             format!(

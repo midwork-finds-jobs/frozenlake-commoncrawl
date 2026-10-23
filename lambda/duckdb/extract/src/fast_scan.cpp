@@ -132,7 +132,18 @@ string TypeAttribute(const char *text, idx_t begin, idx_t end) {
 vector<string> JsonLdScripts(const char *text, idx_t size) {
 	vector<string> scripts;
 	idx_t position = 0;
+	// The next comment is searched only once the scan passed the previous one
+	idx_t comment = FindLower(text, size, 0, "<!--");
 	while ((position = FindLower(text, size, position, "<script")) < size) {
+		// A script in a comment, like an old version of the JSON-LD, isn't on the page
+		if (comment < position) {
+			auto comment_end = FindLower(text, size, comment + 4, "-->");
+			if (comment_end > position) {
+				position = comment_end < size ? comment_end + 3 : size;
+			}
+			comment = FindLower(text, size, comment_end < size ? comment_end + 3 : size, "<!--");
+			continue;
+		}
 		auto tag_begin = position + 7;
 		position = tag_begin;
 		// "<scripts" or "<script-x" is another element
@@ -158,6 +169,10 @@ vector<string> JsonLdScripts(const char *text, idx_t size) {
 		position = content_end;
 		if (TypeAttribute(text, tag_begin, i) == "application/ld+json") {
 			scripts.emplace_back(text + content_begin, content_end - content_begin);
+		}
+		// "<!--" inside a script is text, not a comment
+		if (comment < content_end) {
+			comment = FindLower(text, size, content_end, "<!--");
 		}
 	}
 	return scripts;

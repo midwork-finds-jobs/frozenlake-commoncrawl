@@ -243,7 +243,9 @@ async fn fetch_part(config: &Config, url: &str, timeout: Duration, stats: &mut P
         stats.lambda_ms = stats.lambda_ms.or_else(|| {
             response.headers().get("x-duration-ms").and_then(|value| value.to_str().ok()?.parse().ok())
         });
-        let retryable = matches!(status.as_u16(), 429 | 503);
+        // Lambda's throttling is retried, the monthly limit of the lambda wouldn't pass and costs an invocation
+        let limit_reached = response.headers().contains_key("x-limit-reached");
+        let retryable = matches!(status.as_u16(), 429 | 503) && !limit_reached;
         if retryable && stats.attempts < 4 {
             tokio::time::sleep(Duration::from_millis(1000 * stats.attempts as u64)).await;
             continue;
@@ -482,6 +484,10 @@ fn start(query: Query, timeout: Duration) -> Result<(SchemaRef, mpsc::Receiver<M
         let (query, limit, batches_tx, schema_tx) = (query.clone(), limit.clone(), batches_tx.clone(), schema_tx.clone());
         runtime().spawn(async move {
             let _permit = limit.acquire().await;
+            // The query was cancelled, failed or has enough rows (LIMIT): don't pay for parts nobody reads
+            if batches_tx.is_closed() {
+                return;
+            }
             let part = job.part;
             let mut stats = PartStats { crawl: job.crawl.clone(), part, ..Default::default() };
             let result = match fetch_part(&query.config, &query.url(&job), timeout, &mut stats).await {

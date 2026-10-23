@@ -194,7 +194,7 @@ for SERVICE in cloudfront lambda; do
 done
 ```
 
-OpenTofu reads the current CloudFront timeout quota and uses it for both CloudFront and the lambda timeout, so after an increase is approved just run `tofu apply` again. Nobody would receive results which take longer than CloudFront waits, so the lambda stops at the same time. Check the current values with `tofu output quotas`.
+OpenTofu reads the current CloudFront timeout quota and uses it for both CloudFront and the lambda timeout, so after an increase is approved just run `tofu apply` again. Nobody would receive results which take longer than CloudFront waits, so the lambda interrupts the query 10s before the timeout and returns an error. CloudFront tries the lambda only once (`connection_attempts = 1`): by default it repeats a request which timed out up to three times, which would bill an expensive query three times. Check the current values with `tofu output quotas`.
 
 Queries which scan a lot of files before returning anything (for example filtering by `url` over all crawls) can take longer than the timeout. Use the [`url_surtkey` macros](#query-by-domain-or-url-with-url_surtkey) and filter by `crawl` to read fewer files.
 
@@ -237,7 +237,7 @@ FROM commoncrawl_stats();  -- timings, sizes and fetch counters of every lambda 
 
 The lambda answers `GET /?sql=...` with a zstd compressed Arrow IPC stream. `&level=N` changes the zstd compression level. `GET /usage` returns the lambda usage of the month and queries get `429` after the [monthly limit](#monthly-usage-limit).
 
-Lambda streams responses larger than 6MB at only 2MB/s and bills the whole time. Because of this results larger than 5MB are uploaded into the S3 bucket and the lambda responds with a `303` redirect to `/results/<hash>.arrow` which CloudFront serves from S3 at full speed. Results are deleted after 1 day. Successful results are cached by CloudFront for a day, errors aren't.
+Lambda streams responses larger than 6MB at only 2MB/s and bills the whole time. Because of this results larger than 5MB are uploaded into the S3 bucket and the lambda responds with a `303` redirect to `/results/<hash>.arrow` which CloudFront serves from S3 at full speed. Results are deleted after 1 day. Successful results are cached by CloudFront for a day, errors and results where a record failed to fetch (usually S3 throttling, see `record.error`) aren't. `tofu apply` of a new lambda invalidates the cache so that fixed extractions aren't served from the previous version.
 
 Without the extension the results can be read with the [nanoarrow](https://duckdb.org/community_extensions/extensions/nanoarrow) community extension and cookies from `infra/cloudfront-cookie.sh`:
 
@@ -583,7 +583,7 @@ Named parameters:
 | `concurrency` | lambdas running at the same time, all of them by default |
 | `max_gb_seconds` | fail before starting if the parts could use more |
 
-Before starting more than one lambda the extension checks the [monthly usage](#monthly-usage-limit) and fails if every part running until the timeout could go over it.
+Before starting more than one lambda the extension checks the [monthly usage](#monthly-usage-limit) and fails if every part running until the timeout could go over it. Parts waiting for a free slot aren't started anymore once the query failed, was cancelled or has enough rows for its `LIMIT`, and the `429` of the monthly limit isn't retried.
 
 Measured in October 2026 (3008MB lambdas, warm unless noted):
 

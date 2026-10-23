@@ -73,10 +73,11 @@ auto WithRetries(F function) -> decltype(function()) {
 		try {
 			return function();
 		} catch (std::exception &ex) {
-			if (attempt >= 3 || !IsRetryable(ErrorData(ex))) {
+			if (attempt >= 4 || !IsRetryable(ErrorData(ex))) {
 				throw;
 			}
-			std::this_thread::sleep_for(std::chrono::milliseconds(100 << attempt));
+			// Common Crawl asks to wait at least 1s after a 503 and to back off: 1s, 2s, 4s
+			std::this_thread::sleep_for(std::chrono::milliseconds(1000 << (attempt - 1)));
 		}
 	}
 }

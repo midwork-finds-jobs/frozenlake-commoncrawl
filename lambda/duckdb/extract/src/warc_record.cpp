@@ -170,7 +170,11 @@ private:
 				task = std::move(tasks.front());
 				tasks.pop_front();
 			}
-			task();
+			// An exception out of a thread would terminate the process, tasks report their own errors
+			try {
+				task();
+			} catch (...) {
+			}
 		}
 	}
 };
@@ -685,6 +689,18 @@ struct FetchWaiter {
 	std::condition_variable finished;
 };
 
+//! Waits until done() is true, checking every 100ms whether the query was interrupted, for example by the lambda's
+//! deadline. The fetches keep their own references to the slots, so they can finish after this threw.
+template <class F>
+void WaitForFetches(ClientContext &context, FetchWaiter &waiter, F done) {
+	std::unique_lock<std::mutex> guard(waiter.lock);
+	while (!waiter.finished.wait_for(guard, std::chrono::milliseconds(100), done)) {
+		if (context.IsInterrupted()) {
+			throw InterruptException();
+		}
+	}
+}
+
 bool IsRemote(const string &path) {
 	return StringUtil::StartsWith(path, "s3://") || StringUtil::StartsWith(path, "https://") ||
 	       StringUtil::StartsWith(path, "http://");
@@ -758,22 +774,27 @@ void StartFetch(FetchSettings &settings, const FetchJob &job, const StreamSelect
 				// Parsing doesn't belong on the fetcher thread
 				auto data = make_shared_ptr<string>(std::move(head));
 				FetchPool::Get().Submit([stream_selectors, rest, finish, data]() {
-					StreamingRecord record(stream_selectors);
-					auto more = record.Feed(data->data(), data->size());
-					if (!more && !record.failed) {
-						// The CRC32 is in the trailer at the end of the record, it can't be checked without the rest
-						finish(std::move(record.out), string(), true, true);
-						return;
-					}
-					rest->on_done = [finish, data](string tail, string error) {
-						if (!error.empty()) {
-							finish(string(), std::move(error), false, false);
+					try {
+						StreamingRecord record(stream_selectors);
+						auto more = record.Feed(data->data(), data->size());
+						if (!more && !record.failed) {
+							// The CRC32 is in the trailer at the end of the record, it can't be checked without the rest
+							finish(std::move(record.out), string(), true, true);
 							return;
 						}
-						// Inflated with the CRC32 check like a record fetched at once
-						finish(*data + tail, string(), false, false);
-					};
-					SubmitAsyncRequest(std::move(*rest));
+						rest->on_done = [finish, data](string tail, string error) {
+							if (!error.empty()) {
+								finish(string(), std::move(error), false, false);
+								return;
+							}
+							// Inflated with the CRC32 check like a record fetched at once
+							data->append(tail);
+							finish(std::move(*data), string(), false, false);
+						};
+						SubmitAsyncRequest(std::move(*rest));
+					} catch (std::exception &ex) {
+						finish(string(), ErrorData(ex).RawMessage(), false, false);
+					}
 				});
 			};
 			SubmitAsyncRequest(std::move(first));
@@ -864,17 +885,14 @@ void FetchIntoStruct(ClientContext &context, UnifiedVectorFormat &files, Unified
 		slots[job.row] = make_shared_ptr<FetchSlot>();
 		StartFetch(settings, job, nullptr, waiter, slots[job.row]);
 	}
-	{
-		std::unique_lock<std::mutex> guard(waiter->lock);
-		waiter->finished.wait(guard, [&]() {
-			for (auto &job : jobs) {
-				if (!slots[job.row]->done) {
-					return false;
-				}
+	WaitForFetches(*settings.context, *waiter, [&]() {
+		for (auto &job : jobs) {
+			if (!slots[job.row]->done) {
+				return false;
 			}
-			return true;
-		});
-	}
+		}
+		return true;
+	});
 	result.SetVectorType(VectorType::FLAT_VECTOR);
 	idx_t next_job = 0;
 	for (idx_t i = 0; i < count; i++) {
@@ -1053,17 +1071,14 @@ OperatorResultType WarcFetchFunction(ExecutionContext &context, TableFunctionInp
 	}
 	auto rows = end - start;
 	auto &window = *state.window;
-	{
-		std::unique_lock<std::mutex> guard(window.lock);
-		window.finished.wait(guard, [&]() {
-			for (idx_t i = start; i < end; i++) {
-				if (!window.slots[i]->done) {
-					return false;
-				}
+	WaitForFetches(*state.settings->context, window, [&]() {
+		for (idx_t i = start; i < end; i++) {
+			if (!window.slots[i]->done) {
+				return false;
 			}
-			return true;
-		});
-	}
+		}
+		return true;
+	});
 	auto &record = output.data[output.ColumnCount() - 1];
 	record.SetVectorType(VectorType::FLAT_VECTOR);
 	// Inflating and parsing runs on this DuckDB thread, so it's parallel over the threads of the query

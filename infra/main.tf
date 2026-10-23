@@ -317,6 +317,8 @@ resource "aws_cloudfront_distribution" "query" {
     domain_name              = replace(replace(aws_lambda_function_url.query.function_url, "https://", ""), "/", "")
     origin_id                = "lambda"
     origin_access_control_id = aws_cloudfront_origin_access_control.lambda.id
+    # CloudFront retries a GET which timed out, which would run and bill an expensive query up to three times
+    connection_attempts = 1
 
     custom_origin_config {
       http_port              = 80
@@ -389,5 +391,15 @@ output "quotas" {
   value = {
     cloudfront_response_timeout_seconds = data.aws_servicequotas_service_quota.cloudfront_response_timeout.value
     lambda_network_bandwidth_mbps       = data.aws_servicequotas_service_quota.lambda_network_bandwidth.value
+  }
+}
+
+# Results are cached for a day and were computed by the previous version of the lambda, so a deployment which fixes
+# an extraction invalidates them. One path ("/*") per deployment stays within the 1000 free invalidation paths.
+resource "terraform_data" "invalidate_query_cache" {
+  triggers_replace = [aws_lambda_function.query.source_code_hash]
+
+  provisioner "local-exec" {
+    command = "aws cloudfront create-invalidation --distribution-id ${aws_cloudfront_distribution.query.id} --paths '/*' > /dev/null"
   }
 }

@@ -186,8 +186,12 @@ void CombineCalls(ClientContext &context, vector<unique_ptr<Expression>> &expres
 		auto &html = *(*calls[i].slot)->Cast<BoundFunctionExpression>().GetChildren()[0];
 		vector<idx_t> group;
 		for (idx_t j = i; j < calls.size(); j++) {
+			// The slot of a call combined in an earlier group was replaced, by a CASE for html_extract()
+			if (done[j]) {
+				continue;
+			}
 			auto &other = *(*calls[j].slot)->Cast<BoundFunctionExpression>().GetChildren()[0];
-			if (!done[j] && html.Equals(other)) {
+			if (html.Equals(other)) {
 				group.push_back(j);
 				done[j] = true;
 			}
@@ -266,7 +270,8 @@ public:
 		// The output of the query is the full record
 		PoisonOutput(root);
 		for (auto &fetch : fetches) {
-			if (!fetch.poisoned && !fetch.selectors.empty()) {
+			// Selectors which can't be streamed would only add a second request for the rest of every record
+			if (!fetch.poisoned && !fetch.selectors.empty() && HtmlStreamMatcher::Supports(fetch.selectors)) {
 				SetWarcFetchStreamSelectors(*fetch.get->bind_data, fetch.selectors);
 			}
 		}
@@ -398,6 +403,10 @@ private:
 		switch (op.type) {
 		case LogicalOperatorType::LOGICAL_GET: {
 			auto &get = op.Cast<LogicalGet>();
+			if (!op.children.empty()) {
+				// A table in-out function reads all columns of its input, warc_fetch() also passes them through
+				PoisonOutput(*op.children[0]);
+			}
 			if (IsWarcFetch(get.function.GetName().GetIdentifierName())) {
 				fetches.push_back(Fetch {&get, {}, false});
 				auto bindings = get.GetColumnBindings();
@@ -409,9 +418,6 @@ private:
 						records.emplace_back(bindings[i], fetches.size() - 1);
 					}
 				}
-			} else if (!op.children.empty()) {
-				// A table in-out function reads all columns of its input
-				PoisonOutput(*op.children[0]);
 			}
 			return;
 		}
